@@ -1,0 +1,151 @@
+{
+  "name": "dsh-on-phone",
+  "version": "0.8.11",
+  "private": false,
+  "description": "让手机成为 DeepSeek Harness 的第二块屏：手机浏览器打开你自己 tailnet 里的地址，就能直接用电脑上的 DSH。默认走 Tailscale Serve，无需配对、不经第三方中继。",
+  "type": "module",
+  "bin": {
+    "dsh-on-phone": "lib/cli.js"
+  },
+  "main": "./lib/index.mjs",
+  "types": "./lib/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.mts",
+      "default": "./lib/index.mjs"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.mjs",
+    "lib/**/*.map",
+    "lib/cli.js",
+    "lib/**/*.d.mts",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "TROUBLESHOOTING.md",
+    "LICENSE",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
+    "lib/mobile-layout.js",
+    "assets/screenshots/*"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "check:bundle": "node ./scripts/check-bundle.mjs",
+    "check:dsh-compatibility": "node ./scripts/check-dsh-compatibility.mjs",
+    "check:release-tag": "node ./scripts/check-release-version.mjs --tag-env",
+    "check:version": "node ./scripts/check-release-version.mjs",
+    "clean": "node ./scripts/clean.mjs",
+    "lint": "tsc --noEmit",
+    "test": "vitest run --pool=threads --maxWorkers=1",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run check:version && npm run build",
+    "verify": "npm run check:version && npm run typecheck && npm run test && npm run build && npm run check:bundle && npm pack --dry-run"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JauLukNgai/dsh-on-phone.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JauLukNgai/dsh-on-phone/issues"
+  },
+  "homepage": "https://github.com/JauLukNgai/dsh-on-phone#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "mobile",
+    "phone",
+    "mobile-web",
+    "second-screen",
+    "tailscale",
+    "remote-access"
+  ],
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-connection": "0.1.0-rc.5 || 0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.1-rc.2 || 0.1.2-alpha.1 || 0.1.2-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-sidebar": "0.1.0-rc.5 || 0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.1-rc.2 || 0.1.2-alpha.1 || 0.1.2-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.2",
+    "@deepseek-ai/dsh-commands": "0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.1-rc.2 || 0.1.2-alpha.1 || 0.1.2-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.1.0-rc.5 || 0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.1-rc.2 || 0.1.2-alpha.1 || 0.1.2-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6 || 0.1.0-rc.7 || 0.1.1-rc.2 || 0.1.2-alpha.1 || 0.1.2-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.2",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-connection": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-sidebar": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-commands": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-host-webserver": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "bonjour-service": "^1.4.4",
+    "qrcode": "^1.5.4",
+    "selfsigned": "^5.5.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-commands": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.1.1-rc.2",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.3.0",
+    "@types/react": "~18.3.1",
+    "js-yaml": "^4.3.1",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11",
+    "@types/qrcode": "^1.5.5"
+  },
+  "author": "JauLukNgai",
+  "directories": {
+    "lib": "lib",
+    "test": "tests"
+  }
+}

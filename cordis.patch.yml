@@ -1,0 +1,19 @@
+# Community bundle: Host gateway and browser Client face over any Web-profile
+# composition. It does not patch DSH source files.
+- insert:
+    - id: mobile-access
+      name: dsh-on-phone
+      inject: [webServer, connection]
+      config:
+        setupFile: !!js dshHomePath('mobile-access/setup.json')
+        stateFile: !!js dshHomePath('mobile-access/devices.json')
+        controlFile: !!js dshHomePath('mobile-access/control.json')
+        customCssFile: !!js dshHomePath('mobile-access/mobile.css')
+        customScriptFile: !!js dshHomePath('mobile-access/mobile.js')
+        initiallyEnabled: false
+        listenHost: 127.0.0.1
+        listenPort: 3443
+        upstreamOrigin: http://127.0.0.1:3080
+        allowedCidrs: [127.0.0.0/8]
+        tls:
+          mode: disabled

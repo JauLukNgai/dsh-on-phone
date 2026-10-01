@@ -1,0 +1,2419 @@
+import { createHash, X509Certificate } from 'node:crypto'
+import { createSocket, type Socket as DatagramSocket } from 'node:dgram'
+import { readFile, stat } from 'node:fs/promises'
+import { hostname } from 'node:os'
+import { extname } from 'node:path'
+import {
+  createServer as createHttpServer,
+  request as requestHttp,
+  type ClientRequest,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type OutgoingHttpHeaders,
+  type Server as HttpServer,
+  type ServerResponse,
+} from 'node:http'
+import { createServer as createHttpsServer, type Server as HttpsServer, type ServerOptions } from 'node:https'
+import { connect, isIP, type Socket } from 'node:net'
+import { Transform, type TransformCallback } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { promisify } from 'node:util'
+import { createGzip, gzip } from 'node:zlib'
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import Bonjour from 'bonjour-service'
+import * as QRCode from 'qrcode'
+import {
+  AccessController,
+  AccessError,
+  BoundedRateLimiter,
+  type DeviceSummary,
+  type SessionAuthorization,
+} from './access.js'
+import type { ResolvedGatewayConfig } from './config.js'
+import {
+  AUTH_PREFIX,
+  assertExternalTrust,
+  assertLocalAdminTrust,
+  cookie,
+  CSRF_COOKIE,
+  CSRF_HEADER,
+  CSRF_HEADER_LEGACY,
+  DEVICE_COOKIE,
+  HttpError,
+  LOCAL_ADMIN_PREFIX,
+  parseCookies,
+  isAllowedWebSocketPath,
+  parseRequestTarget,
+  readJsonObject,
+  sendFailure,
+  sendJson,
+  SESSION_COOKIE,
+  setSecurityHeaders,
+} from './http-security.js'
+import {
+  DSH_ON_PHONE_MODULE_ID,
+  DSH_ON_PHONE_VERSION,
+  MINIMUM_ANDROID_APP_VERSION,
+  MOBILE_METADATA_VERSION,
+} from './version.js'
+import { addressAllowed, isLoopbackAddress, type ParsedCidr, RequestTrustPolicy } from './network.js'
+import { relayUpgradedWebSocket } from './websocket-frames.js'
+import { DEFLATE_EXTENSION, offersPerMessageDeflate } from './websocket-deflate.js'
+import { clampHistoryPageBody, HISTORY_PAGE_PATH, HistoryPageBudget } from './history-page-clamp.js'
+import type { DeviceStore } from './storage.js'
+import { listComputerImages, readComputerImage } from './computer-images.js'
+import {
+  MobileExtensionError,
+  type MobileAccessService,
+  type MobileRouteRequest,
+  type MobileRouteResponse,
+} from './extensions.js'
+
+type GatewayServer = HttpServer | HttpsServer
+
+interface ActiveRequest {
+  readonly sessionKey: string
+  readonly deviceId: string
+  readonly expiresAt: number
+  readonly abort: () => void
+  readonly timer: NodeJS.Timeout | undefined
+}
+
+interface ActiveWebSocket {
+  readonly sessionKey: string
+  readonly deviceId: string
+  readonly client: Socket
+  readonly upstream: Socket
+  readonly timer: NodeJS.Timeout
+}
+
+const MAX_CONTROL_BODY_BYTES = 16 * 1024
+const MAX_HEADER_BYTES = 16 * 1024
+// The mobile page size is bounded in two places. This layer rewrites the JSON
+// body of `POST /api/session/page`, the route that carries every history page a
+// phone asks for after its first snapshot — see `history-page-clamp.ts`. That
+// rewrite used to target `POST /api/session.history` here; DSH 0.1.7 removed the
+// route, and the pages their replacements return are large enough that leaving
+// them alone cost the phone megabytes per page (measured: 500 messages =
+// 4,517,693 bytes / 1167 records). The snapshot itself travels as typed
+// session-controller frames over the `/api/remote.mux` WebSocket, where the
+// request carries `maxMessages` inside the protocol payload, so the frame layer
+// clamps it too — see `websocket-frames.ts`, which both proxies run on the
+// client→upstream direction.
+const DISCOVERY_QUERY = Buffer.from('DSH_ON_PHONE_DISCOVER_V1', 'ascii')
+const DISCOVERY_PROTOCOL = 1
+const DISCOVERY_INTERVAL_MS = 3_000
+const MDNS_SERVICE_TYPE = 'dsh-on-phone'
+const MOBILE_LAYOUT_MODULE = '@deepseek-ai/dsh-client-ui-layout'
+const MOBILE_LAYOUT_PATH = `${AUTH_PREFIX}/mobile-layout.js`
+const MOBILE_BOOT_BATCH_PREFIX = `${AUTH_PREFIX}/mobile-boot/`
+const MAX_MOBILE_BOOT_BATCH_BYTES = 32 * 1024 * 1024
+const MAX_MOBILE_BOOT_ENTRY_BYTES = 8 * 1024 * 1024
+const MAX_MOBILE_BOOT_BATCHES = 8
+const UPSTREAM_AUTH_REFRESH_MARGIN_MS = 60_000
+/**
+ * Largest delay `setTimeout` accepts (2^31 - 1 ms, ~24.85 days). A longer delay
+ * overflows the 32-bit timer and is silently truncated to 1 ms, which would
+ * abort the operation immediately instead of at its deadline. Every
+ * session-derived delay must be clamped to this.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+const UPSTREAM_COOKIE_PAIR = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+=[\x21-\x3A\x3C-\x7E]*$/u
+const CUSTOM_STYLE_FALLBACK = '/* Add mobile overrides in the DSH home mobile-access/mobile.css file. */\n'
+const CUSTOM_SCRIPT_FALLBACK = 'window.dshMobile?.register(() => undefined)\n'
+const MOBILE_CLIENT_MODULE = DSH_ON_PHONE_MODULE_ID
+const CONNECTION_MODULE = '@deepseek-ai/dsh-client-connection'
+const RUNTIME_MODULE = '@deepseek-ai/dsh-client-runtime'
+const RENDERER_MODULE = '@deepseek-ai/dsh-client-ui-renderer'
+const SIDEBAR_MODULE = '@deepseek-ai/dsh-client-ui-sidebar'
+const SETTINGS_MODULE = '@deepseek-ai/dsh-client-ui-settings'
+const API_GATEWAY_MODULE = '@deepseek-ai/dsh-api-gateway'
+const MOBILE_LAYOUT_DEPENDENCY_PROFILES = Object.freeze([
+  Object.freeze({
+    slots: RUNTIME_MODULE,
+    dependencies: Object.freeze([RUNTIME_MODULE, '@deepseek-ai/dsh-client-ui-theme']),
+  }),
+  Object.freeze({
+    slots: RENDERER_MODULE,
+    dependencies: Object.freeze([
+      '@deepseek-ai/dsh-client-locale',
+      RENDERER_MODULE,
+      '@deepseek-ai/dsh-client-ui-session',
+      '@deepseek-ai/dsh-client-ui-theme',
+    ]),
+  }),
+])
+const MOBILE_CSRF_FETCH_BOOTSTRAP = `(()=>{const nativeFetch=window.fetch.bind(window);window.fetch=(input,init)=>{const source=input instanceof Request?input:undefined;const method=String(init?.method??source?.method??'GET').toUpperCase();if(method==='GET'||method==='HEAD')return nativeFetch(input,init);const raw=typeof input==='string'?input:input instanceof URL?input.href:source?.url;if(raw===undefined||new URL(raw,location.href).origin!==location.origin)return nativeFetch(input,init);const headers=new Headers(init?.headers??source?.headers);if(!headers.has(${JSON.stringify(CSRF_HEADER)})){const prefix=${JSON.stringify(`${CSRF_COOKIE}=`)};const token=document.cookie.split(';').map(value=>value.trim()).find(value=>value.startsWith(prefix))?.slice(prefix.length);if(token!==undefined)headers.set(${JSON.stringify(CSRF_HEADER)},token)}return nativeFetch(input,{...init,headers})};})();`
+
+/**
+ * Declare this page as the owner of its own transport, before ANY boot module
+ * runs.
+ *
+ * `@deepseek-ai/dsh-client-connection` builds its handle with
+ * `isLoopback: transport?.ownsHost === true || <loopback hostname>`. A phone
+ * page is never on a loopback hostname, so without this the handle is born
+ * `isLoopback: false`.
+ *
+ * Mutating `connection.isLoopback` later from the mobile client module is NOT
+ * equivalent, because `@deepseek-ai/dsh-api-gateway` memoizes the value:
+ *
+ * ```js
+ * get $host() {
+ *   const home = this.connection.generation.getSnapshot()?.host.home
+ *   if (this.hostFacts === void 0 || this.hostFacts.home !== home) this.hostFacts = {
+ *     home, isLoopback: this.connection.isLoopback,
+ *   }
+ *   return this.hostFacts
+ * }
+ * ```
+ *
+ * The cache is keyed on `home` alone. On the remote channel `home` is stable,
+ * so the first consumer of `ctx.remote.$host` freezes `isLoopback: false` for
+ * the life of the page — and `dsh-client-ui-settings`,
+ * `dsh-client-ui-settings-general`, `dsh-api-session-controller` and
+ * `dsh-client-ui-workspace` all read the cached `ctx.remote.$host`. That is why
+ * the trust must exist before the boot manifest is evaluated, not after a
+ * module activates.
+ *
+ * Deviation from upstream: upstream throws when `__DSH_TRANSPORT__` already
+ * exists. This statement shares a script block with the boot manifest
+ * assignment, so throwing would blank the whole mobile page — the failure mode
+ * this plugin has already been burned by. An existing override is therefore
+ * left untouched, and the client-side trust hint remains as the fallback.
+ */
+const MOBILE_AUTHENTICATED_TRANSPORT_BOOTSTRAP = `(()=>{if(window.__DSH_TRANSPORT__!==undefined)return;window.__DSH_TRANSPORT__={fetch:(input,init)=>window.fetch(input,init),ownsHost:true}})();`
+const PAIR_PAGE = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Pair DSH mobile access</title>
+<main>
+  <h1>Pair this device</h1>
+  <form id="pair-form">
+    <label>Pairing code <input id="pair-token" autocomplete="one-time-code" required></label>
+    <label>Device name <input id="device-label" maxlength="64" autocomplete="off"></label>
+    <button type="submit">Pair</button>
+    <output id="pair-status"></output>
+  </form>
+</main>
+<script src="/mobile-access/pair.js" defer></script>
+</html>
+`
+
+interface BootGraphEntry {
+  id: string
+  url: string
+  rev: string
+  inject?: string[]
+  immediately?: boolean
+}
+
+interface BootGraphBatch {
+  phase: 'bootstrap' | 'application'
+  url: string
+  rev: string
+  entries: string[]
+}
+
+interface MobileBootBatchEntry {
+  readonly id: string
+  readonly url: string
+  readonly rev: string
+}
+
+interface MobileBootBatchPlan {
+  readonly key: string
+  readonly path: string
+  readonly entries: readonly MobileBootBatchEntry[]
+}
+
+interface RewrittenMobileIndex {
+  readonly html: string
+  readonly batch?: MobileBootBatchPlan
+}
+
+interface StoredMobileBootBatch {
+  readonly plan: MobileBootBatchPlan
+  body?: Buffer
+  gzipBody?: Buffer
+  etag?: string
+  layoutMtimeMs?: number
+}
+
+const gzipBuffer = promisify(gzip)
+
+function ensureMobileViewport(html: string): string {
+  const viewport = /<meta\b(?=[^>]*\bname\s*=\s*["']viewport["'])[^>]*>/iu
+  const match = viewport.exec(html)
+  if (match === null) {
+    const head = /<head\b[^>]*>/iu.exec(html)
+    if (head?.index === undefined) return html
+    const position = head.index + head[0].length
+    return `${html.slice(0, position)}<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">${html.slice(position)}`
+  }
+  if (/\bviewport-fit\s*=\s*cover\b/iu.test(match[0])) return html
+  const content = /\bcontent\s*=\s*(["'])(.*?)\1/iu
+  const next = content.test(match[0])
+    ? match[0].replace(content, (_whole, quote: string, value: string) => `content=${quote}${value},viewport-fit=cover${quote}`)
+    : match[0].replace(/\s*\/?>$/u, ' content="width=device-width,initial-scale=1,viewport-fit=cover">')
+  return `${html.slice(0, match.index)}${next}${html.slice(match.index + match[0].length)}`
+}
+
+function orderAuthenticatedSettings(entries: BootGraphEntry[], slotsProvider: string): boolean {
+  const mobile = entries.filter(entry => entry !== null && typeof entry === 'object' && entry.id === MOBILE_CLIENT_MODULE)
+  const settings = entries.filter(entry => entry !== null && typeof entry === 'object' && entry.id === SETTINGS_MODULE)
+  if (mobile.length === 0 || settings.length === 0) return false
+  if (mobile.length !== 1 || settings.length !== 1) throw new Error('upstream DSH mobile settings graph is ambiguous')
+  if (!Array.isArray(mobile[0]?.inject)
+    || !mobile[0].inject.includes(CONNECTION_MODULE)
+    || !mobile[0].inject.includes(SIDEBAR_MODULE)) {
+    throw new Error('dsh-on-phone client has unsupported dependencies')
+  }
+  // The settings module has to expose a dependency list we can extend, so that
+  // it activates *after* this plugin has claimed the loopback trust hint that
+  // settings reads exactly once while choosing its persistence backend.
+  //
+  // This used to also demand a `connection` dependency, which rejected a
+  // healthy DSH 0.1.2 graph: settings moved to `remote.$host.isLoopback` and its
+  // declared dependencies became `['@deepseek-ai/dsh-api-remotes']`. Requiring
+  // the old edge would now fail the whole mobile page closed.
+  if (!Array.isArray(settings[0]?.inject)) {
+    throw new Error('upstream DSH settings module has unsupported dependencies')
+  }
+  // DSH 0.1.2 moved settings behind the Remote namespace. On that shape the
+  // API gateway is what memoizes `$host` (see
+  // MOBILE_AUTHENTICATED_TRANSPORT_BOOTSTRAP), so it must also arrive after
+  // this plugin's client module instead of racing it.
+  //
+  // Applied opportunistically rather than as a validated requirement: the
+  // pre-boot transport override above is what makes the trust correct on every
+  // graph, so a DSH release that reshapes these entries should lose this extra
+  // ordering edge, not fail the whole mobile page.
+  const remoteSettings = !settings[0].inject.includes(CONNECTION_MODULE)
+  if (remoteSettings) {
+    for (const gateway of entries) {
+      if (gateway === null || typeof gateway !== 'object' || gateway.id !== API_GATEWAY_MODULE) continue
+      if (!Array.isArray(gateway.inject)) continue
+      if (!gateway.inject.includes(CONNECTION_MODULE)) continue
+      if (!gateway.inject.includes(MOBILE_CLIENT_MODULE)) gateway.inject = [...gateway.inject, MOBILE_CLIENT_MODULE]
+    }
+  }
+  mobile[0].inject = [CONNECTION_MODULE, slotsProvider]
+  if (!settings[0].inject.includes(MOBILE_CLIENT_MODULE)) settings[0].inject = [...settings[0].inject, MOBILE_CLIENT_MODULE]
+  return remoteSettings
+}
+
+function revisionedMobileBatchPath(entries: readonly MobileBootBatchEntry[]): { readonly key: string; readonly path: string } {
+  const key = createHash('sha256')
+    .update(DSH_ON_PHONE_VERSION)
+    .update(JSON.stringify(entries))
+    .digest('hex')
+  return { key, path: `${MOBILE_BOOT_BATCH_PREFIX}${key}.js` }
+}
+
+const BOOT_ASSIGNMENT = /(?:window\.__DSH_BOOT__|globalThis\["__DSH_BOOT__"\])\s*=\s*/u
+
+/**
+ * Marker the plugin injects only into pages it serves itself, so the mobile
+ * client claims the loopback trust hint for its own channels and never for a
+ * page reached through somebody else's reverse proxy.
+ */
+const MOBILE_TRUST_FLAG = 'window.__DSH_ON_PHONE_TRUSTED_GATEWAY__=true;'
+
+interface BootManifestSite {
+  readonly start: number
+  readonly assignment: string
+  readonly scriptEnd: number
+  readonly parsed: { rev?: unknown; entries?: unknown; batches?: unknown }
+}
+
+/** Locate and validate the boot manifest literal inside an upstream DSH index. */
+function locateBootManifest(html: string): BootManifestSite {
+  const assignment = BOOT_ASSIGNMENT.exec(html)
+  if (assignment?.index === undefined) throw new Error('upstream DSH index has no boot manifest')
+  const valueStart = assignment.index + assignment[0].length
+  const scriptEnd = html.indexOf('</script>', valueStart)
+  if (scriptEnd < 0) throw new Error('upstream DSH boot manifest script is incomplete')
+  const parsed = JSON.parse(html.slice(valueStart, scriptEnd).trim().replace(/;$/u, '')) as BootManifestSite['parsed']
+  if (typeof parsed.rev !== 'string' || !Array.isArray(parsed.entries)) {
+    throw new Error('upstream DSH boot manifest is malformed')
+  }
+  return { start: assignment.index, assignment: assignment[0], scriptEnd, parsed }
+}
+
+/**
+ * Resolve the unique stock layout module and its supported dependency profile.
+ *
+ * `dedicated` reports whether this fork's `mobile-layout.js` can stand in for
+ * that module: it may only do so when every dependency the stock module
+ * declares is one the matched profile already knows. DSH 0.1.7 reshaped the
+ * layout contract — its stock layout module now also depends on
+ * `@deepseek-ai/dsh-client-shortcuts` (and no longer on
+ * `@deepseek-ai/dsh-client-runtime`) and registers the `sidebar` / `main`
+ * (keyed) / `rightbar` / `shell.overlay` / `shell.leading` slots, while
+ * `mobile-layout.js` declares `conversation` / `details`. Serving a layout the
+ * rest of the page does not match leaves the conversation with no slot to
+ * render into, so an unknown dependency keeps the stock layout and the DOM
+ * layer adapts the stock DOM instead.
+ */
+function requireLayoutModule(entries: BootGraphEntry[]): { readonly slots: string; readonly entry: BootGraphEntry; readonly dedicated: boolean } {
+  const layout = entries.filter(entry => entry !== null && typeof entry === 'object' && entry.id === MOBILE_LAYOUT_MODULE)
+  if (layout.length !== 1) throw new Error('upstream DSH boot manifest has no unique layout module')
+  const entry = layout[0]
+  if (entry === undefined || typeof entry.url !== 'string' || typeof entry.rev !== 'string') {
+    throw new Error('upstream DSH boot manifest has no unique layout module')
+  }
+  if (!Array.isArray(entry.inject)) {
+    throw new Error('upstream DSH layout module has unsupported dependencies')
+  }
+  const inject: readonly string[] = entry.inject
+  const dependencyProfile = MOBILE_LAYOUT_DEPENDENCY_PROFILES.find(profile => (
+    profile.dependencies.every(dependency => inject.includes(dependency))
+  ))
+  if (dependencyProfile === undefined) throw new Error('upstream DSH layout module has unsupported dependencies')
+  const known = new Set<string>(dependencyProfile.dependencies)
+  const dedicated = inject.every(dependency => known.has(dependency))
+  return { slots: dependencyProfile.slots, entry, dedicated }
+}
+
+function rewriteMobileIndexWithBatch(html: string): RewrittenMobileIndex {
+  const site = locateBootManifest(html)
+  const parsed = site.parsed
+  const entries = parsed.entries as BootGraphEntry[]
+  const layout = requireLayoutModule(entries)
+  if (layout.dedicated) {
+    layout.entry.url = MOBILE_LAYOUT_PATH
+    layout.entry.rev = `dsh-on-phone-layout-${DSH_ON_PHONE_VERSION}`
+  }
+  const remoteSettings = orderAuthenticatedSettings(entries, layout.slots)
+
+  let mobileBatch: MobileBootBatchPlan | undefined
+  if (parsed.batches !== undefined) {
+    if (!Array.isArray(parsed.batches)) throw new Error('upstream DSH boot manifest batches are malformed')
+    const batches = parsed.batches as BootGraphBatch[]
+    const entryById = new Map(entries.map(entry => [entry.id, entry]))
+    if (entryById.size !== entries.length) throw new Error('upstream DSH boot manifest has duplicate entries')
+    const layoutBatches: BootGraphBatch[] = []
+    for (const batch of batches) {
+      if (batch === null || typeof batch !== 'object'
+        || (batch.phase !== 'bootstrap' && batch.phase !== 'application')
+        || typeof batch.url !== 'string' || typeof batch.rev !== 'string'
+        || !Array.isArray(batch.entries) || batch.entries.length === 0
+        || batch.entries.some(id => typeof id !== 'string' || !entryById.has(id))) {
+        throw new Error('upstream DSH boot manifest batches are malformed')
+      }
+      if (batch.entries.includes(MOBILE_LAYOUT_MODULE)) layoutBatches.push(batch)
+    }
+    if (layoutBatches.length !== 1 || layoutBatches[0]?.phase !== 'application') {
+      throw new Error('upstream DSH boot manifest has no unique application layout batch')
+    }
+    const layoutBatch = layoutBatches[0]
+    const planEntries = layoutBatch.entries.map((id): MobileBootBatchEntry => {
+      const entry = entryById.get(id)
+      if (entry === undefined || typeof entry.url !== 'string' || typeof entry.rev !== 'string') {
+        throw new Error('upstream DSH boot manifest batches are malformed')
+      }
+      return Object.freeze({ id, url: entry.url, rev: entry.rev })
+    })
+    const revision = revisionedMobileBatchPath(planEntries)
+    layoutBatch.url = revision.path
+    layoutBatch.rev = revision.key
+    mobileBatch = Object.freeze({ ...revision, entries: Object.freeze(planEntries) })
+    parsed.rev = createHash('sha256').update(JSON.stringify({ entries, batches })).digest('hex').slice(0, 16)
+  }
+  // The transport override is what upstream ships for the remote-backed
+  // settings graph; on every other graph the client-side trust hint covers it.
+  const transportBootstrap = remoteSettings ? MOBILE_AUTHENTICATED_TRANSPORT_BOOTSTRAP : ''
+  const replacement = `${transportBootstrap}${MOBILE_CSRF_FETCH_BOOTSTRAP}${MOBILE_TRUST_FLAG}window.__DSH_ON_PHONE_FRONTEND__="dedicated";${site.assignment}${JSON.stringify(parsed)};`
+  return Object.freeze({
+    html: ensureMobileViewport(`${html.slice(0, site.start)}${replacement}${html.slice(site.scriptEnd)}`),
+    ...(mobileBatch === undefined ? {} : { batch: mobileBatch }),
+  })
+}
+
+/** Replace only DSH's layout client module while retaining its complete plugin graph. */
+export function rewriteMobileIndex(html: string): string {
+  return rewriteMobileIndexWithBatch(html).html
+}
+
+/**
+ * Rewrite the mobile index for the pairing-free remote (Tailscale Serve) channel.
+ *
+ * The passthrough proxy owns that origin rather than this gateway, so there is
+ * no boot batch to hand out and the stock layout module is left in place — the
+ * remote channel keeps DSH's own layout with the surface adaptation. Only the
+ * authenticated-transport override, the trusted-gateway flag and the settings
+ * ordering are applied here, because without them DSH resolves its settings to
+ * the in-memory backend and the phone cannot load the model provider directory
+ * at all.
+ *
+ * The transport override is injected unconditionally here, not only on the
+ * remote-backed settings graph: a page on a `*.ts.net` origin is never loopback,
+ * and this channel has no second chance to correct the value once
+ * `@deepseek-ai/dsh-api-gateway` has memoized `$host`. A DSH release that does
+ * not read `__DSH_TRANSPORT__` simply ignores the global.
+ * @param html - Upstream DSH index document.
+ * @returns The document with the mobile trust flag and the settings ordering applied.
+ */
+export function rewriteRemoteMobileIndex(html: string): string {
+  const site = locateBootManifest(html)
+  const entries = site.parsed.entries as BootGraphEntry[]
+  orderAuthenticatedSettings(entries, requireLayoutModule(entries).slots)
+  const replacement = `${MOBILE_AUTHENTICATED_TRANSPORT_BOOTSTRAP}${MOBILE_TRUST_FLAG}${site.assignment}${JSON.stringify(site.parsed)};`
+  return ensureMobileViewport(`${html.slice(0, site.start)}${replacement}${html.slice(site.scriptEnd)}`)
+}
+
+const PAIR_SCRIPT = `(() => {
+  const form = document.getElementById('pair-form')
+  const token = document.getElementById('pair-token')
+  const label = document.getElementById('device-label')
+  const status = document.getElementById('pair-status')
+  const fragment = new URLSearchParams(location.hash.slice(1))
+  const supplied = fragment.get('token')
+  history.replaceState(null, '', location.pathname)
+  if (supplied) token.value = supplied
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault()
+    status.value = 'Pairing…'
+    const response = await fetch('/mobile-access/auth/pair', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: token.value, label: label.value || undefined }),
+    })
+    if (!response.ok) {
+      status.value = 'Pairing failed'
+      return
+    }
+    location.replace('/')
+  })
+})()
+`
+
+const LOGIN_PAGE = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Reconnect DSH mobile access</title>
+<main>
+  <h1>Reconnect this device</h1>
+  <p id="login-progress">Restoring the secure Session…</p>
+  <section id="login-failed" hidden>
+    <p>This device is no longer paired. Open pairing on the computer, then pair it again.</p>
+    <a href="/mobile-access/pair">Open pairing</a>
+  </section>
+</main>
+<script src="/mobile-access/login.js" defer></script>
+</html>
+`
+
+const LOGIN_SCRIPT = `(() => {
+  const candidate = new URL(location.href).searchParams.get('return')
+  let returnPath = '/'
+  if (candidate && candidate.startsWith('/')) {
+    try {
+      const resolved = new URL(candidate, location.origin)
+      const pathname = decodeURIComponent(resolved.pathname)
+      if (resolved.origin === location.origin && pathname !== '/mobile-access'
+        && !pathname.startsWith('/mobile-access/') && !pathname.includes('\\\\')) {
+        returnPath = resolved.pathname + resolved.search + resolved.hash
+      }
+    } catch {
+      // Malformed untrusted return targets keep the safe root default.
+    }
+  }
+  fetch('/mobile-access/auth/renew', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).then((response) => {
+    if (response.ok) {
+      location.replace(returnPath)
+      return
+    }
+    document.getElementById('login-progress').hidden = true
+    document.getElementById('login-failed').hidden = false
+  }).catch(() => {
+    document.getElementById('login-progress').textContent = 'The computer is unavailable.'
+  })
+})()
+`
+
+class ByteLimitTransform extends Transform {
+  private total = 0
+
+  constructor(private readonly maximum: number) {
+    super()
+  }
+
+  override _transform(chunk: Buffer, encoding: BufferEncoding, callback: TransformCallback): void {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+    this.total += buffer.length
+    if (this.total > this.maximum) {
+      callback(new HttpError(413, 'payload_too_large'))
+      return
+    }
+    callback(null, buffer)
+  }
+}
+
+export function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
+}
+
+interface PemCertificate {
+  readonly pem: string
+  readonly certificate: X509Certificate
+}
+
+function parsePemCertificates(contents: Buffer, source: string): PemCertificate[] {
+  const text = contents.toString('utf8')
+  const pattern = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/gu
+  const blocks = text.match(pattern) ?? []
+  if (blocks.length === 0 || text.replace(pattern, '').trim() !== '') {
+    throw new Error(`${source} must contain only PEM certificates`)
+  }
+  return blocks.map((pem) => {
+    let certificate: X509Certificate
+    try {
+      certificate = new X509Certificate(pem)
+    } catch (error) {
+      throw new Error(`${source} contains an invalid certificate`, { cause: error })
+    }
+    return Object.freeze({ pem: `${pem}\n`, certificate })
+  })
+}
+
+function validateServerChain(chain: readonly PemCertificate[]): void {
+  const now = Date.now()
+  for (const [index, entry] of chain.entries()) {
+    if (Date.parse(entry.certificate.validFrom) > now || Date.parse(entry.certificate.validTo) <= now) {
+      throw new Error('TLS certificate chain contains a certificate that is not currently valid')
+    }
+    if (index === 0) continue
+    if (entry.certificate.subject === entry.certificate.issuer
+      && entry.certificate.verify(entry.certificate.publicKey)) {
+      throw new Error('TLS server certificate chain must not include a self-signed root')
+    }
+    const child = chain[index - 1]!.certificate
+    if (!entry.certificate.ca || !child.checkIssued(entry.certificate)
+      || !child.verify(entry.certificate.publicKey)) {
+      throw new Error('TLS server certificate chain is not an ordered leaf-to-intermediate chain')
+    }
+  }
+}
+
+async function tlsOptions(config: ResolvedGatewayConfig): Promise<ServerOptions> {
+  if (config.tls.mode === 'disabled') throw new Error('TLS options requested for a disabled listener')
+  const [certFile, key, additionalChainFile] = await Promise.all([
+    readFile(config.tls.certFile),
+    readFile(config.tls.keyFile),
+    config.tls.caFile === undefined ? Promise.resolve(undefined) : readFile(config.tls.caFile),
+  ])
+  const chain = [
+    ...parsePemCertificates(certFile, 'tls.certFile'),
+    ...(additionalChainFile === undefined ? [] : parsePemCertificates(additionalChainFile, 'tls.caFile')),
+  ]
+  validateServerChain(chain)
+  const leaf = chain[0]!.certificate
+  for (const authority of config.authorities) {
+    const hostname = stripIpv6Brackets(authority.hostname)
+    const match = isIP(hostname) === 0 ? leaf.checkHost(hostname) : leaf.checkIP(hostname)
+    if (match === undefined) throw new Error(`TLS certificate does not cover configured authority ${hostname}`)
+  }
+  return {
+    cert: chain.map(entry => entry.pem).join(''),
+    key,
+    requestCert: false,
+    minVersion: 'TLSv1.2',
+    maxHeaderSize: MAX_HEADER_BYTES,
+  }
+}
+
+export function websocketAccept(key: string): string {
+  return createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, 'ascii').digest('base64')
+}
+
+function headerValue(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name]
+  return Array.isArray(value) ? undefined : value
+}
+
+function hasToken(header: string | undefined, token: string): boolean {
+  return header?.split(',').some(value => value.trim().toLowerCase() === token) ?? false
+}
+
+function rejectUpgrade(socket: Socket, status: number, code: string): void {
+  if (socket.destroyed) return
+  const body = `${JSON.stringify({ error: code })}\n`
+  socket.end([
+    `HTTP/1.1 ${String(status)} ${status === 401 ? 'Unauthorized' : status === 403 ? 'Forbidden' : 'Bad Request'}`,
+    'Connection: close',
+    'Cache-Control: no-store',
+    'Content-Type: application/json; charset=utf-8',
+    'Referrer-Policy: no-referrer',
+    'X-Content-Type-Options: nosniff',
+    `Content-Length: ${String(Buffer.byteLength(body))}`,
+    '',
+    body,
+  ].join('\r\n'))
+}
+
+export function sanitizeRequestHeaders(
+  request: IncomingMessage,
+  upstream: URL,
+): OutgoingHttpHeaders {
+  const headers: OutgoingHttpHeaders = {
+    host: upstream.host,
+  }
+  if (request.headers.origin !== undefined) headers.origin = upstream.origin
+  if (request.headers['sec-fetch-site'] !== undefined) headers['sec-fetch-site'] = 'same-origin'
+  const allowed = [
+    'accept', 'accept-encoding', 'accept-language', 'content-encoding', 'content-length', 'content-type',
+    'if-match', 'if-modified-since', 'if-none-match', 'if-unmodified-since', 'range', 'user-agent',
+  ] as const
+  for (const name of allowed) {
+    const value = request.headers[name]
+    if (value !== undefined) headers[name] = value
+  }
+  return headers
+}
+
+const BLOCKED_RESPONSE_HEADERS = new Set([
+  'alt-svc', 'cache-control', 'connection', 'content-security-policy', 'content-security-policy-report-only',
+  'cross-origin-embedder-policy', 'cross-origin-opener-policy', 'cross-origin-resource-policy', 'expires',
+  'keep-alive', 'nel', 'permissions-policy', 'pragma', 'proxy-authenticate', 'referrer-policy',
+  'report-to', 'reporting-endpoints', 'server', 'set-cookie', 'strict-transport-security', 'trailer',
+  'transfer-encoding', 'upgrade', 'via', 'x-content-type-options', 'x-frame-options', 'x-powered-by',
+])
+
+export function sanitizeResponseHeaders(headers: IncomingHttpHeaders, upstream: URL): OutgoingHttpHeaders {
+  const clean: OutgoingHttpHeaders = {}
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase()
+    if (value === undefined || BLOCKED_RESPONSE_HEADERS.has(lower) || lower.startsWith('access-control-')) continue
+    if (lower === 'location' && typeof value === 'string') {
+      try {
+        const location = new URL(value, upstream)
+        clean.location = location.origin === upstream.origin
+          ? `${location.pathname}${location.search}${location.hash}`
+          : value
+      } catch {
+        continue
+      }
+      continue
+    }
+    clean[lower] = value
+  }
+  return clean
+}
+
+function acceptsGzip(header: string | undefined): boolean {
+  if (header === undefined) return false
+  let wildcard: boolean | undefined
+  for (const entry of header.split(',')) {
+    const [rawName, ...parameters] = entry.split(';')
+    const name = rawName?.trim().toLowerCase()
+    if (name === undefined || name === '') continue
+    let quality = 1
+    for (const parameter of parameters) {
+      const match = /^\s*q\s*=\s*(0(?:\.\d+)?|1(?:\.0+)?)\s*$/iu.exec(parameter)
+      if (match !== null) quality = Number(match[1])
+    }
+    if (name === 'gzip') return quality > 0
+    if (name === '*') wildcard = quality > 0
+  }
+  return wildcard ?? false
+}
+
+function isCompressibleContentType(value: string | string[] | undefined): boolean {
+  const contentType = Array.isArray(value) ? value[0] : value
+  if (contentType === undefined) return false
+  const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  return mediaType.startsWith('text/')
+    || /^(?:application\/(?:javascript|json|xml|x-javascript)|image\/svg\+xml)$/u.test(mediaType)
+}
+
+function shouldCompressResponse(request: IncomingMessage, response: IncomingMessage): boolean {
+  const pathname = request.url?.split('?', 1)[0] ?? ''
+  const compressibleRequest = request.method === 'GET'
+    && (pathname.startsWith('/plugins/') || pathname.startsWith('/assets/'))
+  return compressibleRequest
+    && response.statusCode === 200
+    && request.headers.range === undefined
+    && response.headers['content-range'] === undefined
+    && response.headers['content-encoding'] === undefined
+    && acceptsGzip(request.headers['accept-encoding'])
+    && isCompressibleContentType(response.headers['content-type'])
+}
+
+/**
+ * Cache policy for content-addressed static assets.
+ *
+ * `sanitizeResponseHeaders` drops `cache-control` because an upstream header
+ * cannot be trusted across the trust boundary, so every channel has to put back
+ * the one policy it knows is safe: a `rev`-stamped `/plugins/` bundle or a
+ * hashed `/assets/` file never changes under its own URL, while anything
+ * without a revision gets no long lifetime.
+ */
+export function revisionedStaticCacheControl(request: IncomingMessage): string | undefined {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return undefined
+  let target: URL
+  try { target = new URL(request.url ?? '/', 'https://dsh-on-phone.invalid') } catch { return undefined }
+  const revision = target.searchParams.get('rev')
+  const hasRevision = revision !== null && /^[a-z0-9_-]{4,128}$/iu.test(revision)
+  const hashedAsset = /^\/assets\/.*-[a-z0-9_-]{8,}\.[a-z0-9]+$/iu.test(target.pathname)
+  if (!(target.pathname.startsWith('/plugins/') && hasRevision)
+    && !(target.pathname.startsWith('/assets/') && (hasRevision || hashedAsset))) return undefined
+  return 'private, max-age=31536000, immutable'
+}
+
+function addVaryAcceptEncoding(headers: OutgoingHttpHeaders): void {
+  const existing = headers.vary
+  const rawValues: string[] = Array.isArray(existing)
+    ? existing.map(value => String(value))
+    : existing === undefined ? [] : [String(existing)]
+  const values = rawValues.flatMap(value => value.split(',').map(part => part.trim()).filter(Boolean))
+  if (!values.some(value => value.toLowerCase() === 'accept-encoding')) values.push('Accept-Encoding')
+  headers.vary = values.join(', ')
+}
+
+function requestCookies(request: IncomingMessage): ReadonlyMap<string, string> {
+  const cookies = parseCookies(request.headers.cookie)
+  if (cookies === undefined) throw new HttpError(401, 'authentication_failed')
+  return cookies
+}
+
+function mapError(error: unknown): HttpError {
+  if (error instanceof HttpError) return error
+  if (error instanceof AccessError) return new HttpError(error.status, error.code)
+  if (error instanceof MobileExtensionError) return new HttpError(error.status, error.code)
+  return new HttpError(500, 'internal_error')
+}
+
+function discoveryDeviceName(): string {
+  const value = hostname().trim().replaceAll(/[\u0000-\u001f\u007f]/gu, '')
+  return (value === '' ? 'DeepSeek Harness' : value).slice(0, 63)
+}
+
+function discoveryMdnsHost(instanceId: string): string {
+  const label = hostname().toLowerCase().replaceAll(/[^a-z0-9-]/gu, '-').replaceAll(/^-+|-+$/gu, '').slice(0, 40)
+  return `${label === '' ? 'dsh' : label}-${instanceId.slice(0, 8)}.local`
+}
+
+function discoveryBroadcastTargets(cidrs: readonly ParsedCidr[]): readonly string[] {
+  const targets = new Set<string>(['255.255.255.255'])
+  for (const cidr of cidrs) {
+    if (cidr.bits !== 32 || cidr.prefix >= 32) continue
+    const hostBits = BigInt(32 - cidr.prefix)
+    const broadcast = cidr.network | ((1n << hostBits) - 1n)
+    targets.add([24n, 16n, 8n, 0n].map(shift => Number((broadcast >> shift) & 0xffn)).join('.'))
+  }
+  return [...targets]
+}
+
+function extensionTarget(pathname: string):
+  | { readonly kind: 'manifest' }
+  | { readonly kind: 'script' | 'style' | 'asset'; readonly id: string; readonly path?: string }
+  | { readonly kind: 'action'; readonly id: string; readonly action: string }
+  | { readonly kind: 'route'; readonly id: string; readonly path: string }
+  | undefined {
+  const prefix = `${AUTH_PREFIX}/extensions`
+  if (pathname === prefix || pathname === `${prefix}/` || pathname === `${prefix}/manifest`) return { kind: 'manifest' }
+  if (!pathname.startsWith(`${prefix}/`)) return undefined
+  const parts = pathname.slice(prefix.length + 1).split('/')
+  const id = parts.shift()
+  if (id === undefined || !/^[a-z][a-z0-9-]{0,63}$/u.test(id)) return undefined
+  const leaf = parts.shift()
+  if (leaf === 'mobile.js' && parts.length === 0) return { kind: 'script', id }
+  if (leaf === 'mobile.css' && parts.length === 0) return { kind: 'style', id }
+  if (leaf === 'assets' && parts.length > 0) return { kind: 'asset', id, path: parts.join('/') }
+  if (leaf === 'actions' && parts.length === 1 && /^[a-z][a-z0-9-]{0,63}$/u.test(parts[0]!)) return { kind: 'action', id, action: parts[0]! }
+  if (leaf === 'routes') return { kind: 'route', id, path: `/${parts.join('/')}`.replace(/\/{2,}/gu, '/') }
+  return undefined
+}
+
+function mobileBootBatchKey(pathname: string): string | undefined {
+  const match = new RegExp(`^${MOBILE_BOOT_BATCH_PREFIX.replaceAll('/', '\\/')}([a-f\\d]{64})\\.js$`, 'u').exec(pathname)
+  return match?.[1]
+}
+
+async function readBoundedBody(request: IncomingMessage, maximum: number): Promise<Buffer> {
+  const declared = request.headers['content-length']
+  if (declared !== undefined && (!/^\d+$/u.test(declared) || Number(declared) > maximum)) {
+    throw new HttpError(413, 'payload_too_large')
+  }
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    total += buffer.length
+    if (total > maximum) throw new HttpError(413, 'payload_too_large')
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
+function extensionRequestHeaders(headers: IncomingHttpHeaders): Readonly<Record<string, string>> {
+  const allowed = new Set(['accept', 'content-type', 'content-length', 'content-range', 'range', 'if-none-match', 'if-modified-since'])
+  const output: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers)) {
+    if (!allowed.has(name) || typeof value !== 'string') continue
+    output[name] = value
+  }
+  return Object.freeze(output)
+}
+
+function extensionContentType(path: string): string {
+  const type = {
+    '.css': 'text/css; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8',
+    '.gif': 'image/gif',
+    '.html': 'text/html; charset=utf-8',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.js': 'text/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.svg': 'image/svg+xml',
+    '.webp': 'image/webp',
+  }[extname(path).toLowerCase()]
+  return type ?? 'application/octet-stream'
+}
+
+/** Authenticated TLS edge in front of the ordinary loopback-only DSH Web server. */
+export class MobileAccessGateway {
+  readonly access: AccessController
+  private readonly listenerTlsEnabled: boolean
+  private readonly tlsEnabled: boolean
+  private policy: RequestTrustPolicy | undefined
+  private server: GatewayServer | undefined
+  private discoverySocket: DatagramSocket | undefined
+  private discoveryTimer: NodeJS.Timeout | undefined
+  private bonjour: Bonjour | undefined
+  private pairingCaCertificate: string | undefined
+  private listenerPort: number | undefined
+  private readonly connectedSockets = new Set<Socket>()
+  private readonly activeRequests = new Map<number, ActiveRequest>()
+  private readonly activeWebSockets = new Map<number, ActiveWebSocket>()
+  private readonly mobileBootBatches = new Map<string, StoredMobileBootBatch>()
+  /** Page sizes granted to the phone, so history pages stay small (see the module). */
+  private readonly historyPages = new HistoryPageBudget()
+  private upstreamCookie: string | undefined
+  private upstreamCookieExpiresAt = 0
+  private upstreamCookieTask: Promise<string> | undefined
+  private upstreamAuthRequest: ClientRequest | undefined
+  private nextOperationId = 1
+  private closing = false
+  private started = false
+  private closeTask: Promise<void> | undefined
+  private readonly removeSessionListener: () => void
+  private readonly renewLimiter: BoundedRateLimiter
+
+  constructor(
+    readonly config: ResolvedGatewayConfig,
+    store: DeviceStore,
+    private readonly extensions?: MobileAccessService,
+    private readonly upstreamAuthenticatedUrl?: string,
+  ) {
+    this.listenerTlsEnabled = config.tls.mode === 'provided'
+    this.tlsEnabled = config.publicTls
+    this.access = new AccessController(store, {
+      pairingTtlMs: config.pairingTtlMs,
+      deviceTtlMs: config.deviceTtlMs,
+      sessionTtlMs: config.sessionTtlMs,
+      maxDevices: config.maxDevices,
+      maxSessions: config.maxSessions,
+      rateLimitWindowMs: config.rateLimitWindowMs,
+      maxPairingAttempts: config.maxPairingAttempts,
+      maxRateLimitKeys: config.maxRateLimitKeys,
+    })
+    this.renewLimiter = new BoundedRateLimiter(
+      Math.min(100, config.maxPairingAttempts * 4),
+      config.rateLimitWindowMs,
+      config.maxRateLimitKeys,
+    )
+    this.removeSessionListener = this.access.onSessionEnded(authorization => {
+      this.abortSessionResources(authorization.sessionKey)
+    })
+  }
+
+  /** Initialize durable state, validate TLS, and bind the externally reachable listener. */
+  async start(): Promise<void> {
+    if (this.started || this.server !== undefined) throw new Error('mobile-access gateway cannot be started twice')
+    this.started = true
+    await this.access.initialize()
+    try {
+      if (this.config.pairingCaFile !== undefined) {
+        const certificate = new X509Certificate(await readFile(this.config.pairingCaFile))
+        const fingerprint = certificate.fingerprint256.replaceAll(':', '').toLowerCase()
+        if (!certificate.ca || certificate.subject !== certificate.issuer
+          || !certificate.verify(certificate.publicKey) || fingerprint !== this.config.instanceId) {
+          throw new Error('pairingCaFile must be the self-signed CA identified by instanceId')
+        }
+        this.pairingCaCertificate = certificate.raw.toString('base64')
+      }
+      const handler = (request: IncomingMessage, response: ServerResponse): void => {
+        void this.handleExternalRequest(request, response).catch((error: unknown) => {
+          const mapped = mapError(error)
+          if (response.headersSent) response.destroy()
+          else sendFailure(response, mapped.status, mapped.code, this.tlsEnabled)
+        })
+      }
+      const server = this.listenerTlsEnabled
+        ? createHttpsServer(await tlsOptions(this.config), handler)
+        : createHttpServer({ maxHeaderSize: MAX_HEADER_BYTES }, handler)
+      this.server = server
+      server.maxHeadersCount = 64
+      server.maxConnections = this.config.maxConnections
+      server.headersTimeout = 10_000
+      server.requestTimeout = this.config.upstreamTimeoutMs
+      server.keepAliveTimeout = 5_000
+      server.on('connection', (socket: Socket) => {
+        if (this.connectedSockets.size >= this.config.maxConnections) {
+          socket.destroy()
+          return
+        }
+        this.connectedSockets.add(socket)
+        socket.on('error', () => { socket.destroy() })
+        socket.once('close', () => { this.connectedSockets.delete(socket) })
+      })
+      server.on('connect', (_request, socket) => { socket.destroy() })
+      server.on('upgrade', (request, socket, head) => {
+        void this.handleUpgrade(request, socket as Socket, head).catch((error: unknown) => {
+          const mapped = mapError(error)
+          rejectUpgrade(socket as Socket, mapped.status, mapped.code)
+        })
+      })
+      server.on('clientError', (_error, socket) => { rejectUpgrade(socket as Socket, 400, 'bad_request') })
+      await new Promise<void>((resolve, reject) => {
+        const failed = (error: Error): void => { reject(error) }
+        server.once('error', failed)
+        server.listen(this.config.listenPort, this.config.listenHost, () => {
+          server.off('error', failed)
+          resolve()
+        })
+      })
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('gateway listener has no TCP address')
+      this.listenerPort = address.port
+      this.policy = new RequestTrustPolicy(
+        this.config.authorities,
+        address.port,
+        this.config.allowedCidrs,
+        this.tlsEnabled,
+      )
+      if (this.config.discovery) await this.startDiscovery(address.port)
+    } catch (error) {
+      await this.closeFailedStart()
+      throw error
+    }
+  }
+
+  private async startDiscovery(port: number): Promise<void> {
+    const socket = createSocket('udp4')
+    this.discoverySocket = socket
+    const announcement = this.discoveryAnnouncement(port)
+    socket.on('message', (message, remote) => {
+      if (this.closing || !message.equals(DISCOVERY_QUERY)
+        || !addressAllowed(remote.address, this.config.allowedCidrs)) return
+      socket.send(announcement, remote.port, remote.address, () => undefined)
+    })
+    await new Promise<void>((resolve, reject) => {
+      const failed = (error: Error): void => { reject(error) }
+      socket.once('error', failed)
+      // The UDP socket is IPv4-only; only a literal IPv4 loopback address is bindable, never ::1.
+      const bindHost = isIP(this.config.listenHost) === 4 && isLoopbackAddress(this.config.listenHost) ? this.config.listenHost : '0.0.0.0'
+      socket.bind(port, bindHost, () => {
+        socket.off('error', failed)
+        socket.setBroadcast(true)
+        resolve()
+      })
+    })
+    const announce = (): void => {
+      for (const target of discoveryBroadcastTargets(this.config.allowedCidrs)) {
+        socket.send(announcement, port, target, () => undefined)
+      }
+    }
+    announce()
+    this.discoveryTimer = setInterval(announce, DISCOVERY_INTERVAL_MS)
+    this.discoveryTimer.unref()
+
+    const deviceName = discoveryDeviceName()
+    const bonjour = new Bonjour({ disableIPv6: true })
+    this.bonjour = bonjour
+    bonjour.publish({
+      name: `${deviceName} (${this.config.instanceId.slice(0, 8)})`,
+      type: MDNS_SERVICE_TYPE,
+      protocol: 'tcp',
+      port,
+      host: discoveryMdnsHost(this.config.instanceId),
+      disableIPv6: true,
+      txt: {
+        deviceName,
+        origin: this.address().origin,
+        instanceId: this.config.instanceId,
+        protocol: String(DISCOVERY_PROTOCOL),
+      },
+    })
+  }
+
+  private discoveryAnnouncement(port: number): Buffer {
+    return Buffer.from(JSON.stringify({
+      deviceName: discoveryDeviceName(),
+      origin: this.address().origin,
+      port,
+      protocol: DISCOVERY_PROTOCOL,
+      instanceId: this.config.instanceId,
+    }), 'utf8')
+  }
+
+  private async closeFailedStart(): Promise<void> {
+    if (this.discoveryTimer !== undefined) clearInterval(this.discoveryTimer)
+    this.discoveryTimer = undefined
+    await this.closeBonjour()
+    this.discoverySocket?.close()
+    this.discoverySocket = undefined
+    for (const socket of this.connectedSockets) socket.destroy()
+    const server = this.server
+    this.server = undefined
+    if (server?.listening === true) {
+      await new Promise<void>(resolve => { server.close(() => resolve()) })
+    }
+    await this.access.close()
+  }
+
+  private async closeBonjour(): Promise<void> {
+    const bonjour = this.bonjour
+    this.bonjour = undefined
+    if (bonjour === undefined) return
+    await new Promise<void>(resolve => {
+      bonjour.unpublishAll(() => { bonjour.destroy(() => resolve()) })
+    })
+  }
+
+  /** Actual bound address, available after start and safe for loopback status output. */
+  address(): { host: string; port: number; origin: string } {
+    if (this.listenerPort === undefined || this.policy === undefined) throw new Error('gateway is not listening')
+    const origin = this.policy.origins.values().next().value as string | undefined
+    if (origin === undefined) throw new Error('gateway has no public authority')
+    return Object.freeze({ host: this.config.listenHost, port: this.listenerPort, origin })
+  }
+
+  private requirePolicy(): RequestTrustPolicy {
+    if (this.policy === undefined || this.closing) throw new HttpError(503, 'unavailable')
+    return this.policy
+  }
+
+  private authorize(request: IncomingMessage): SessionAuthorization {
+    const sessionToken = requestCookies(request).get(SESSION_COOKIE)
+    if (sessionToken === undefined) throw new HttpError(401, 'authentication_failed')
+    return this.access.authorizeSession(sessionToken)
+  }
+
+  private requireCsrf(request: IncomingMessage, authorization: SessionAuthorization): void {
+    const value = headerValue(request.headers, CSRF_HEADER) ?? headerValue(request.headers, CSRF_HEADER_LEGACY)
+    this.access.assertCsrf(authorization, value)
+  }
+
+  private setSessionCookies(response: ServerResponse, result: {
+    sessionToken: string
+    csrfToken: string
+    sessionExpiresAt: number
+  }, now: number): void {
+    const maxAge = (result.sessionExpiresAt - now) / 1000
+    response.setHeader('Set-Cookie', [
+      cookie(SESSION_COOKIE, result.sessionToken, { tls: this.tlsEnabled, httpOnly: true, path: '/', maxAgeSeconds: maxAge }),
+      cookie(CSRF_COOKIE, result.csrfToken, { tls: this.tlsEnabled, httpOnly: false, path: '/', maxAgeSeconds: maxAge }),
+    ])
+  }
+
+  private async handlePair(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+    if (typeof body.token !== 'string' || (body.label !== undefined && typeof body.label !== 'string')) {
+      throw new HttpError(400, 'bad_request')
+    }
+    const result = await this.access.pair(request.socket.remoteAddress ?? 'unknown', body.token, body.label as string | undefined)
+    const now = Date.now()
+    this.setSessionCookies(response, result, now)
+    const sessionCookies = response.getHeader('Set-Cookie') as string[]
+    response.setHeader('Set-Cookie', [
+      ...sessionCookies,
+      cookie(DEVICE_COOKIE, result.deviceToken, {
+        tls: this.tlsEnabled,
+        httpOnly: true,
+        path: '/mobile-access/auth/renew',
+        maxAgeSeconds: (result.deviceExpiresAt - now) / 1000,
+      }),
+    ])
+    sendJson(response, 201, {
+      paired: true,
+      deviceId: result.deviceId,
+      csrfToken: result.csrfToken,
+      sessionExpiresAt: result.sessionExpiresAt,
+    }, this.tlsEnabled)
+  }
+
+  private async handleRenew(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.renewLimiter.take(request.socket.remoteAddress ?? 'unknown', Date.now())) {
+      throw new HttpError(429, 'rate_limited')
+    }
+    await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+    const deviceToken = requestCookies(request).get(DEVICE_COOKIE)
+    if (deviceToken === undefined) throw new HttpError(401, 'authentication_failed')
+    let result
+    try {
+      result = await this.access.renew(deviceToken)
+    } catch (error) {
+      if (error instanceof AccessError && error.status === 401) {
+        response.setHeader('Set-Cookie', cookie(DEVICE_COOKIE, '', {
+          tls: this.tlsEnabled,
+          httpOnly: true,
+          path: '/mobile-access/auth/renew',
+          maxAgeSeconds: 0,
+        }))
+      }
+      throw error
+    }
+    this.setSessionCookies(response, result, Date.now())
+    sendJson(response, 200, {
+      renewed: true,
+      deviceId: result.deviceId,
+      csrfToken: result.csrfToken,
+      sessionExpiresAt: result.sessionExpiresAt,
+    }, this.tlsEnabled)
+  }
+
+  private async handleNativePair(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+    if (typeof body.token !== 'string' || (body.label !== undefined && typeof body.label !== 'string')) {
+      throw new HttpError(400, 'bad_request')
+    }
+    const result = await this.access.pair(
+      request.socket.remoteAddress ?? 'unknown',
+      body.token,
+      body.label as string | undefined,
+    )
+    sendJson(response, 201, {
+      instanceId: this.config.instanceId,
+      deviceId: result.deviceId,
+      deviceToken: result.deviceToken,
+      deviceExpiresAt: result.deviceExpiresAt,
+      sessionToken: result.sessionToken,
+      csrfToken: result.csrfToken,
+      sessionExpiresAt: result.sessionExpiresAt,
+    }, this.tlsEnabled)
+  }
+
+  private async handleNativeRenew(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.renewLimiter.take(request.socket.remoteAddress ?? 'unknown', Date.now())) {
+      throw new HttpError(429, 'rate_limited')
+    }
+    const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+    if (typeof body.deviceToken !== 'string') throw new HttpError(400, 'bad_request')
+    const result = await this.access.renew(body.deviceToken)
+    sendJson(response, 200, {
+      instanceId: this.config.instanceId,
+      deviceId: result.deviceId,
+      sessionToken: result.sessionToken,
+      csrfToken: result.csrfToken,
+      sessionExpiresAt: result.sessionExpiresAt,
+    }, this.tlsEnabled)
+  }
+
+  private async handleLogout(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+    const authorization = this.authorize(request)
+    this.requireCsrf(request, authorization)
+    this.access.logout(authorization)
+    response.setHeader('Set-Cookie', [
+      cookie(SESSION_COOKIE, '', { tls: this.tlsEnabled, httpOnly: true, path: '/', maxAgeSeconds: 0 }),
+      cookie(CSRF_COOKIE, '', { tls: this.tlsEnabled, httpOnly: false, path: '/', maxAgeSeconds: 0 }),
+    ])
+    sendJson(response, 200, { loggedOut: true }, this.tlsEnabled)
+  }
+
+  private async handleExternalRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const target = parseRequestTarget(request.url)
+    const policy = this.requirePolicy()
+    const isMutation = request.method !== 'GET' && request.method !== 'HEAD'
+    assertExternalTrust(request, policy, isMutation)
+    if (target.decodedPathname === LOCAL_ADMIN_PREFIX || target.decodedPathname.startsWith(`${LOCAL_ADMIN_PREFIX}/`)) {
+      throw new HttpError(404, 'not_found')
+    }
+    if (request.method === 'TRACE' || request.method === 'CONNECT') throw new HttpError(405, 'method_not_allowed')
+
+    if (target.search === '' && request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/health`) {
+      sendJson(response, 200, { ok: true }, this.tlsEnabled)
+      return
+    }
+    if (target.search === '' && request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/metadata`) {
+      sendJson(response, 200, {
+        version: MOBILE_METADATA_VERSION,
+        pluginVersion: DSH_ON_PHONE_VERSION,
+        minimumAndroidAppVersion: MINIMUM_ANDROID_APP_VERSION,
+        discoveryProtocol: DISCOVERY_PROTOCOL,
+      }, this.tlsEnabled)
+      return
+    }
+    if (target.search === '' && request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/discovery`) {
+      sendJson(response, 200, {
+        deviceName: discoveryDeviceName(),
+        origin: this.address().origin,
+        port: this.address().port,
+        protocol: DISCOVERY_PROTOCOL,
+        instanceId: this.config.instanceId,
+      }, this.tlsEnabled)
+      return
+    }
+    if (target.search === '' && request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/ca.cer`) {
+      if (this.pairingCaCertificate === undefined) throw new HttpError(404, 'not_found')
+      const body = Buffer.from(this.pairingCaCertificate, 'base64')
+      setSecurityHeaders(response, this.tlsEnabled)
+      response.writeHead(200, {
+        'Content-Type': 'application/pkix-cert',
+        'Content-Length': body.length,
+        'Cache-Control': 'no-store',
+      })
+      response.end(body)
+      return
+    }
+    if (target.search === '' && request.method === 'GET'
+      && (target.decodedPathname === `${AUTH_PREFIX}/pair` || target.decodedPathname === `${AUTH_PREFIX}/pair.js`)) {
+      if (!this.access.pairingStatus().open) throw new HttpError(404, 'not_found')
+      setSecurityHeaders(response, this.tlsEnabled)
+      const body = target.decodedPathname.endsWith('.js') ? PAIR_SCRIPT : PAIR_PAGE
+      response.writeHead(200, {
+        'Content-Type': target.decodedPathname.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      response.end(body)
+      return
+    }
+    if (request.method === 'GET'
+      && (target.decodedPathname === `${AUTH_PREFIX}/login` || target.decodedPathname === `${AUTH_PREFIX}/login.js`)) {
+      if (target.decodedPathname.endsWith('.js') && target.search !== '') throw new HttpError(400, 'bad_request')
+      setSecurityHeaders(response, this.tlsEnabled)
+      const body = target.decodedPathname.endsWith('.js') ? LOGIN_SCRIPT : LOGIN_PAGE
+      response.writeHead(200, {
+        'Content-Type': target.decodedPathname.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      })
+      response.end(body)
+      return
+    }
+    if (target.search === '' && request.method === 'POST' && target.decodedPathname === `${AUTH_PREFIX}/auth/pair`) {
+      await this.handlePair(request, response)
+      return
+    }
+    if (target.search === '' && request.method === 'POST' && target.decodedPathname === `${AUTH_PREFIX}/auth/renew`) {
+      await this.handleRenew(request, response)
+      return
+    }
+    if (target.search === '' && request.method === 'POST' && target.decodedPathname === `${AUTH_PREFIX}/auth/native-pair`) {
+      await this.handleNativePair(request, response)
+      return
+    }
+    if (target.search === '' && request.method === 'POST' && target.decodedPathname === `${AUTH_PREFIX}/auth/native-renew`) {
+      await this.handleNativeRenew(request, response)
+      return
+    }
+    if (target.search === '' && request.method === 'POST' && target.decodedPathname === `${AUTH_PREFIX}/auth/logout`) {
+      await this.handleLogout(request, response)
+      return
+    }
+    const computerImages = request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/computer-images`
+    const computerImage = request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/computer-image`
+    const requestedExtension = extensionTarget(target.decodedPathname)
+    const requestedMobileBootBatch = mobileBootBatchKey(target.decodedPathname)
+    const customAsset = request.method === 'GET'
+      ? target.decodedPathname === `${AUTH_PREFIX}/custom.css`
+        ? {
+            file: this.config.customCssFile,
+            contentType: 'text/css; charset=utf-8',
+            fallback: CUSTOM_STYLE_FALLBACK,
+          }
+        : target.decodedPathname === `${AUTH_PREFIX}/custom.js`
+          ? {
+              file: this.config.customScriptFile,
+              contentType: 'text/javascript; charset=utf-8',
+              fallback: CUSTOM_SCRIPT_FALLBACK,
+            }
+          : target.decodedPathname === MOBILE_LAYOUT_PATH
+            ? {
+                file: this.config.mobileLayoutFile,
+                contentType: 'text/javascript; charset=utf-8',
+                fallback: undefined,
+              }
+          : undefined
+      : undefined
+    if (customAsset === undefined && requestedMobileBootBatch === undefined && !computerImages && !computerImage
+      && extensionTarget(target.decodedPathname) === undefined
+      && (target.decodedPathname === AUTH_PREFIX || target.decodedPathname.startsWith(`${AUTH_PREFIX}/`))) {
+      throw new HttpError(404, 'not_found')
+    }
+
+    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'POST'
+      && requestedExtension?.kind !== 'route') {
+      throw new HttpError(405, 'method_not_allowed')
+    }
+    let authorization: SessionAuthorization
+    try {
+      authorization = this.authorize(request)
+    } catch (error) {
+      const mapped = mapError(error)
+      const acceptsHtml = request.headers.accept?.split(',').some(value => value.trim().split(';', 1)[0] === 'text/html') ?? false
+      const topLevel = request.method === 'GET'
+        && acceptsHtml
+        && (request.headers['sec-fetch-dest'] === undefined || request.headers['sec-fetch-dest'] === 'document')
+        && target.decodedPathname !== '/api'
+        && !target.decodedPathname.startsWith('/api/')
+      if (mapped.status === 401 && topLevel) {
+        const returnPath = target.raw.length <= 2048 ? target.raw : '/'
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.writeHead(302, {
+          Location: `${AUTH_PREFIX}/login?return=${encodeURIComponent(returnPath)}`,
+          'Content-Length': 0,
+        })
+        response.end()
+        return
+      }
+      throw error
+    }
+    if (isMutation) this.requireCsrf(request, authorization)
+    const extension = requestedExtension
+    if (extension !== undefined) {
+      await this.handleExtensionRequest(extension, target, request, response, authorization)
+      return
+    }
+    if (requestedMobileBootBatch !== undefined) {
+      await this.serveMobileBootBatch(requestedMobileBootBatch, request, response, authorization)
+      return
+    }
+    if (customAsset !== undefined) {
+      const operation = this.allocateRequest(authorization, response, {})
+      try {
+        let body: Buffer
+        let mtime: Date | undefined
+        try {
+          body = await readFile(customAsset.file, { signal: operation.signal })
+          try {
+            const fileStat = await stat(customAsset.file)
+            mtime = fileStat.mtime
+          } catch { /* keep undefined */ }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          if (customAsset.fallback === undefined) throw new HttpError(503, 'mobile_frontend_unavailable')
+          body = Buffer.from(customAsset.fallback)
+        }
+        if (body.byteLength > 256 * 1024) throw new HttpError(413, 'payload_too_large')
+        const etag = createHash('sha256').update(body).digest('hex')
+        const ifNoneMatch = headerValue(request.headers, 'if-none-match')
+        if (ifNoneMatch !== undefined && ifNoneMatch === etag) {
+          setSecurityHeaders(response, this.tlsEnabled)
+          response.writeHead(304)
+          response.end()
+          return
+        }
+        setSecurityHeaders(response, this.tlsEnabled)
+        const responseHeaders: Record<string, string | number> = {
+          'Content-Type': customAsset.contentType,
+          'Content-Length': body.byteLength,
+          'ETag': etag,
+        }
+        if (mtime !== undefined) responseHeaders['Last-Modified'] = mtime.toUTCString()
+        response.writeHead(200, responseHeaders)
+        response.end(body)
+        return
+      } finally {
+        operation.release()
+      }
+    }
+    if (computerImages) {
+      const operation = this.allocateRequest(authorization, response, {})
+      try {
+        const query = new URL(target.raw, this.address().origin).searchParams
+        sendJson(response, 200, await listComputerImages(query.get('path'), operation.signal), this.tlsEnabled)
+        return
+      } finally {
+        operation.release()
+      }
+    }
+    if (computerImage) {
+      const operation = this.allocateRequest(authorization, response, {})
+      try {
+        const query = new URL(target.raw, this.address().origin).searchParams
+        const image = await readComputerImage(query.get('path'), operation.signal)
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.writeHead(200, {
+          'Content-Type': image.contentType,
+          'Content-Length': image.body.byteLength,
+          'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(image.name)}`,
+        })
+        response.end(image.body)
+        return
+      } finally {
+        operation.release()
+      }
+    }
+    const stockFrontend = new URL(target.raw, this.address().origin).searchParams.get('frontend') === 'stock'
+    const acceptsHtml = request.headers.accept?.split(',').some(value => value.trim().split(';', 1)[0] === 'text/html') ?? false
+    if (request.method === 'GET' && acceptsHtml && !stockFrontend) {
+      await this.proxyMobileIndex(request, response, authorization)
+      return
+    }
+    if (stockFrontend && target.decodedPathname === '/') request.url = '/'
+    await this.proxyHttp(request, response, authorization)
+  }
+
+  private async handleExtensionRequest(
+    targetInfo: NonNullable<ReturnType<typeof extensionTarget>>,
+    target: ReturnType<typeof parseRequestTarget>,
+    request: IncomingMessage,
+    response: ServerResponse,
+    authorization: SessionAuthorization,
+  ): Promise<void> {
+    const extensions = this.extensions
+    if (extensions === undefined) throw new HttpError(404, 'not_found')
+    if (targetInfo.kind === 'manifest') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed')
+      const operation = this.allocateRequest(authorization, response, {})
+      try {
+        operation.signal.throwIfAborted()
+        const customRevision = async (file: string, fallback: string): Promise<string> => {
+          let source: Buffer
+          try {
+            source = await readFile(file, { signal: operation.signal })
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+            source = Buffer.from(fallback)
+          }
+          if (source.byteLength > 256 * 1024) throw new HttpError(413, 'payload_too_large')
+          return createHash('sha256').update(source).digest('hex')
+        }
+        const [scriptRevision, styleRevision] = await Promise.all([
+          customRevision(this.config.customScriptFile, CUSTOM_SCRIPT_FALLBACK),
+          customRevision(this.config.customCssFile, CUSTOM_STYLE_FALLBACK),
+        ])
+        const body = Buffer.from(JSON.stringify({
+          protocol: 1,
+          extensions: extensions.manifest(),
+          legacy: { scriptRevision, styleRevision },
+        }))
+        // The ETag must cover extension content, not just the manifest body, so
+        // editing mobile.js/css alone invalidates the client's cached manifest.
+        const etag = createHash('sha256').update(body).update(extensions.contentDigest()).digest('hex')
+        if (headerValue(request.headers, 'if-none-match') === etag) {
+          setSecurityHeaders(response, this.tlsEnabled); response.writeHead(304); response.end(); return
+        }
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.byteLength, ETag: etag })
+        if (request.method === 'HEAD') response.end(); else response.end(body)
+        return
+      } finally {
+        operation.release()
+      }
+    }
+    if (targetInfo.kind === 'script' || targetInfo.kind === 'style' || targetInfo.kind === 'asset') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed')
+      const operation = this.allocateRequest(authorization, response, {})
+      try {
+        const file = targetInfo.kind === 'script'
+          ? await extensions.readClientFile(targetInfo.id, 'script', operation.signal)
+          : targetInfo.kind === 'style'
+            ? await extensions.readClientFile(targetInfo.id, 'style', operation.signal)
+            : await extensions.readAsset(targetInfo.id, targetInfo.path ?? '', operation.signal)
+        if (headerValue(request.headers, 'if-none-match') === file.digest) {
+          setSecurityHeaders(response, this.tlsEnabled); response.writeHead(304); response.end(); return
+        }
+        const contentType = targetInfo.kind === 'script'
+          ? 'text/javascript; charset=utf-8'
+          : targetInfo.kind === 'style' ? 'text/css; charset=utf-8' : extensionContentType(targetInfo.path ?? '')
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.writeHead(200, { 'Content-Type': contentType, 'Content-Length': file.body.byteLength, ETag: file.digest })
+        if (request.method === 'HEAD') response.end(); else response.end(file.body)
+        return
+      } finally {
+        operation.release()
+      }
+    }
+    if (targetInfo.kind === 'action') {
+      if (request.method !== 'POST') throw new HttpError(405, 'method_not_allowed')
+      const body = await readJsonObject(request, 1024 * 1024)
+      const operation = this.allocateRequest(authorization, response, {})
+      const abort = new AbortController()
+      response.once('close', () => { abort.abort() })
+      const generationSignal = extensions.signal(targetInfo.id)
+      const onGenerationAbort = (): void => { abort.abort(); if (!response.destroyed) response.destroy() }
+      generationSignal?.addEventListener('abort', onGenerationAbort, { once: true })
+      try {
+        const result = await extensions.invoke(targetInfo.id, targetInfo.action, body, { signal: abort.signal, deviceId: authorization.deviceId })
+        let serialized: Buffer
+        try { serialized = Buffer.from(JSON.stringify(result)) } catch { throw new MobileExtensionError('extension_failed', 'extension action failed', 500) }
+        if (serialized.byteLength > 4 * 1024 * 1024) throw new MobileExtensionError('extension_result_too_large', 'extension result is too large', 500)
+        sendJson(response, 200, result, this.tlsEnabled)
+      } finally {
+        generationSignal?.removeEventListener('abort', onGenerationAbort)
+        abort.abort(); operation.release()
+      }
+      return
+    }
+    if (targetInfo.kind === 'route') {
+      const method = request.method ?? 'GET'
+      if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) throw new HttpError(405, 'method_not_allowed')
+      const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBoundedBody(request, this.config.maxBodyBytes)
+      const operation = this.allocateRequest(authorization, response, {})
+      const abort = new AbortController()
+      response.once('close', () => { abort.abort() })
+      const generationSignal = extensions.signal(targetInfo.id)
+      const onGenerationAbort = (): void => { abort.abort(); if (!response.destroyed) response.destroy() }
+      generationSignal?.addEventListener('abort', onGenerationAbort, { once: true })
+      try {
+        const parsed = new URL(target.raw, this.address().origin)
+        const routeRequest: MobileRouteRequest = {
+          method, pathname: targetInfo.path, query: parsed.searchParams,
+          headers: extensionRequestHeaders(request.headers), body, signal: abort.signal, deviceId: authorization.deviceId,
+        }
+        const result = await extensions.route(targetInfo.id, method, targetInfo.path, routeRequest)
+        await this.sendExtensionResponse(response, result, request.method === 'HEAD')
+      } finally {
+        generationSignal?.removeEventListener('abort', onGenerationAbort)
+        abort.abort(); operation.release()
+      }
+    }
+  }
+
+  private async sendExtensionResponse(response: ServerResponse, result: MobileRouteResponse, head: boolean): Promise<void> {
+    const contentType = result.contentType ?? 'application/octet-stream'
+    if (!/^[\w!#$&+.^-]+\/[\w!#$&+.^-]+(?:;[\s\S]*)?$/u.test(contentType)) throw new MobileExtensionError('invalid_route_response', 'extension returned an invalid content type', 500)
+    const safeHeaders: Record<string, string> = {}
+    for (const [name, value] of Object.entries(result.headers ?? {})) {
+      if (!/^(?:content-disposition|cache-control|etag)$/iu.test(name) || /[\r\n]/u.test(value)) continue
+      safeHeaders[name] = value
+    }
+    setSecurityHeaders(response, this.tlsEnabled)
+    if (typeof result.body === 'string' || result.body instanceof Uint8Array) {
+      const body = typeof result.body === 'string' ? Buffer.from(result.body) : Buffer.from(result.body)
+      if (body.byteLength > 4 * 1024 * 1024) throw new MobileExtensionError('extension_result_too_large', 'extension response is too large', 500)
+      response.writeHead(result.status ?? 200, { ...safeHeaders, 'Content-Type': contentType, 'Content-Length': body.byteLength })
+      if (head) response.end(); else response.end(body)
+      return
+    }
+    response.writeHead(result.status ?? 200, { ...safeHeaders, 'Content-Type': contentType })
+    if (head) { result.body.destroy(); response.end(); return }
+    await pipeline(result.body, new ByteLimitTransform(4 * 1024 * 1024), response)
+  }
+
+  /** Exchange DSH's process-local launch token for an authority-bound cookie kept inside this gateway. */
+  private async upstreamCookieHeader(): Promise<string | undefined> {
+    if (this.upstreamAuthenticatedUrl === undefined) return undefined
+    if (this.upstreamCookie !== undefined
+      && this.upstreamCookieExpiresAt > Date.now() + UPSTREAM_AUTH_REFRESH_MARGIN_MS) {
+      return this.upstreamCookie
+    }
+    if (this.upstreamCookieTask !== undefined) return this.upstreamCookieTask
+    const task = this.exchangeUpstreamCookie()
+    this.upstreamCookieTask = task
+    try {
+      return await task
+    } finally {
+      if (this.upstreamCookieTask === task) this.upstreamCookieTask = undefined
+    }
+  }
+
+  private async exchangeUpstreamCookie(): Promise<string> {
+    const authenticatedUrl = this.upstreamAuthenticatedUrl
+    if (authenticatedUrl === undefined) throw new HttpError(502, 'upstream_unavailable')
+    let target: URL
+    try {
+      target = new URL(authenticatedUrl)
+    } catch {
+      throw new HttpError(502, 'upstream_unavailable')
+    }
+    if (target.origin !== this.config.upstreamOrigin.origin || target.pathname !== '/'
+      || target.hash !== '' || target.search === '') {
+      throw new HttpError(502, 'upstream_unavailable')
+    }
+    try {
+      const proxied = await new Promise<IncomingMessage>((resolve, reject) => {
+        const upstreamRequest = requestHttp({
+          protocol: 'http:',
+          hostname: stripIpv6Brackets(this.config.upstreamOrigin.hostname),
+          port: Number(this.config.upstreamOrigin.port),
+          method: 'GET',
+          path: `${target.pathname}${target.search}`,
+          headers: {
+            host: this.config.upstreamOrigin.host,
+            accept: 'text/html',
+            'accept-encoding': 'identity',
+          },
+          agent: false,
+        })
+        this.upstreamAuthRequest = upstreamRequest
+        upstreamRequest.setTimeout(this.config.upstreamTimeoutMs, () => {
+          upstreamRequest.destroy(new Error('upstream timeout'))
+        })
+        upstreamRequest.once('response', resolve)
+        upstreamRequest.once('error', reject)
+        upstreamRequest.end()
+      })
+      await new Promise<void>((resolve, reject) => {
+        proxied.once('end', resolve)
+        proxied.once('error', reject)
+        proxied.resume()
+      })
+      const setCookie = proxied.headers['set-cookie']?.[0]
+      const pair = setCookie?.split(';', 1)[0]
+      const maxAgeText = setCookie === undefined
+        ? undefined
+        : /(?:^|;\s*)Max-Age=(\d+)(?:;|$)/iu.exec(setCookie)?.[1]
+      const maxAgeSeconds = maxAgeText === undefined ? Number.NaN : Number(maxAgeText)
+      const expiresAt = Date.now() + maxAgeSeconds * 1000
+      if (proxied.statusCode !== 303 || pair === undefined || pair.length > 4096
+        || !UPSTREAM_COOKIE_PAIR.test(pair) || !Number.isSafeInteger(expiresAt)
+        || maxAgeSeconds <= 0) {
+        throw new HttpError(502, 'upstream_unavailable')
+      }
+      this.upstreamCookie = pair
+      this.upstreamCookieExpiresAt = expiresAt
+      return pair
+    } catch (error) {
+      if (error instanceof HttpError) throw error
+      throw new HttpError(502, 'upstream_unavailable')
+    } finally {
+      this.upstreamAuthRequest?.destroy()
+      this.upstreamAuthRequest = undefined
+    }
+  }
+
+  private async proxyMobileIndex(
+    request: IncomingMessage,
+    response: ServerResponse,
+    authorization: SessionAuthorization,
+  ): Promise<void> {
+    // A new document is a new first paint: let every session open small again.
+    this.historyPages.reset()
+    const holder: { request?: ClientRequest } = {}
+    const operation = this.allocateRequest(authorization, response, holder)
+    try {
+      const upstreamHeaders = sanitizeRequestHeaders(request, this.config.upstreamOrigin)
+      const upstreamCookie = await this.upstreamCookieHeader()
+      if (upstreamCookie !== undefined) upstreamHeaders.cookie = upstreamCookie
+      upstreamHeaders['accept-encoding'] = 'identity'
+      const proxied = await new Promise<IncomingMessage>((resolve, reject) => {
+        const upstreamRequest = requestHttp({
+          protocol: 'http:',
+          hostname: stripIpv6Brackets(this.config.upstreamOrigin.hostname),
+          port: Number(this.config.upstreamOrigin.port),
+          method: 'GET',
+          path: '/',
+          headers: upstreamHeaders,
+          agent: false,
+        })
+        holder.request = upstreamRequest
+        upstreamRequest.setTimeout(this.config.upstreamTimeoutMs, () => {
+          upstreamRequest.destroy(new Error('upstream timeout'))
+        })
+        upstreamRequest.once('response', resolve)
+        upstreamRequest.once('error', reject)
+        upstreamRequest.end()
+      })
+      if ((proxied.statusCode ?? 502) !== 200) throw new HttpError(502, 'upstream_unavailable')
+      const chunks: Buffer[] = []
+      let bytes = 0
+      for await (const chunk of proxied) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        bytes += buffer.byteLength
+        if (bytes > 4 * 1024 * 1024) throw new HttpError(502, 'upstream_unavailable')
+        chunks.push(buffer)
+      }
+      const stock = Buffer.concat(chunks)
+      let body: Buffer
+      try {
+        const rewritten = rewriteMobileIndexWithBatch(stock.toString('utf8'))
+        if (rewritten.batch !== undefined) this.rememberMobileBootBatch(rewritten.batch)
+        body = Buffer.from(rewritten.html)
+      } catch (error) {
+        // The remote channel already degrades this way. Failing closed here meant
+        // that a boot manifest this build does not recognize produced a bare 502
+        // on the phone instead of a usable page. The manifest is generated by the
+        // host, so a shape change is not something the phone can recover from, and
+        // DSH's own document is strictly better than no document: the phone still
+        // reaches the harness, it just loses this plugin's mobile boot injections.
+        process.stderr.write(`[dsh-on-phone] gateway served the stock document: ${error instanceof Error ? error.message : String(error)}\n`)
+        body = stock
+      }
+      const headers = sanitizeResponseHeaders(proxied.headers, this.config.upstreamOrigin)
+      delete headers['content-length']
+      delete headers['content-encoding']
+      delete headers.etag
+      setSecurityHeaders(response, this.tlsEnabled)
+      response.writeHead(200, {
+        ...headers,
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': body.byteLength,
+      })
+      response.end(body)
+    } catch (error) {
+      holder.request?.destroy()
+      if (error instanceof HttpError) throw error
+      if (response.headersSent) response.destroy()
+      else throw new HttpError(502, 'upstream_unavailable')
+    } finally {
+      operation.release()
+    }
+  }
+
+  private rememberMobileBootBatch(plan: MobileBootBatchPlan): void {
+    const existing = this.mobileBootBatches.get(plan.key)
+    this.mobileBootBatches.delete(plan.key)
+    this.mobileBootBatches.set(plan.key, existing ?? { plan })
+    while (this.mobileBootBatches.size > MAX_MOBILE_BOOT_BATCHES) {
+      const oldest = this.mobileBootBatches.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.mobileBootBatches.delete(oldest)
+    }
+  }
+
+  private async serveMobileBootBatch(
+    key: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+    authorization: SessionAuthorization,
+  ): Promise<void> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed')
+    const stored = this.mobileBootBatches.get(key)
+    if (stored === undefined) throw new HttpError(404, 'not_found')
+    const operation = this.allocateRequest(authorization, response, {})
+    try {
+      const layoutStat = await stat(this.config.mobileLayoutFile)
+      if (stored.body === undefined || stored.etag === undefined || stored.layoutMtimeMs !== layoutStat.mtimeMs) {
+        const body = await this.assembleMobileBootBatch(stored.plan, operation.signal)
+        stored.body = body
+        delete stored.gzipBody
+        stored.etag = createHash('sha256').update(body).digest('hex')
+        stored.layoutMtimeMs = layoutStat.mtimeMs
+      }
+      const compressed = acceptsGzip(request.headers['accept-encoding'])
+      const body = compressed
+        ? stored.gzipBody ??= await gzipBuffer(stored.body)
+        : stored.body
+      const etag = compressed ? `${stored.etag}-gzip` : stored.etag
+      const headers: OutgoingHttpHeaders = {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Content-Length': body.byteLength,
+        'Cache-Control': 'private, no-cache',
+        ETag: etag,
+      }
+      if (compressed) headers['Content-Encoding'] = 'gzip'
+      addVaryAcceptEncoding(headers)
+      if (headerValue(request.headers, 'if-none-match') === etag) {
+        setSecurityHeaders(response, this.tlsEnabled)
+        response.writeHead(304, { ETag: etag, 'Cache-Control': 'private, no-cache', Vary: String(headers.vary) })
+        response.end()
+        return
+      }
+      setSecurityHeaders(response, this.tlsEnabled)
+      response.writeHead(200, headers)
+      if (request.method === 'HEAD') response.end()
+      else response.end(body)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new HttpError(503, 'mobile_frontend_unavailable')
+      throw error
+    } finally {
+      operation.release()
+    }
+  }
+
+  private async assembleMobileBootBatch(plan: MobileBootBatchPlan, signal: AbortSignal): Promise<Buffer> {
+    const bodies = new Array<Buffer>(plan.entries.length)
+    let cursor = 0
+    const worker = async (): Promise<void> => {
+      while (cursor < plan.entries.length) {
+        const index = cursor++
+        const entry = plan.entries[index]!
+        bodies[index] = entry.id === MOBILE_LAYOUT_MODULE
+          ? await readFile(this.config.mobileLayoutFile, { signal })
+          : await this.readUpstreamClientBundle(entry.url, signal)
+        if (bodies[index]!.byteLength > MAX_MOBILE_BOOT_ENTRY_BYTES) throw new HttpError(502, 'upstream_unavailable')
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(8, plan.entries.length) }, worker))
+    const total = bodies.reduce((bytes, body) => bytes + body.byteLength + 2, 0)
+    if (total > MAX_MOBILE_BOOT_BATCH_BYTES) throw new HttpError(502, 'upstream_unavailable')
+    return Buffer.concat(bodies.flatMap(body => [body, Buffer.from('\n;\n')]))
+  }
+
+  private async readUpstreamClientBundle(source: string, signal: AbortSignal): Promise<Buffer> {
+    if (!source.startsWith('/plugins/') || source.includes('#')) throw new HttpError(502, 'upstream_unavailable')
+    const target = new URL(source, this.config.upstreamOrigin)
+    if (target.origin !== this.config.upstreamOrigin.origin) throw new HttpError(502, 'upstream_unavailable')
+    let upstreamRequest: ClientRequest | undefined
+    const aborted = (): void => { upstreamRequest?.destroy(new Error('request aborted')) }
+    signal.addEventListener('abort', aborted, { once: true })
+    try {
+      const upstreamCookie = await this.upstreamCookieHeader()
+      const proxied = await new Promise<IncomingMessage>((resolve, reject) => {
+        upstreamRequest = requestHttp({
+          protocol: 'http:',
+          hostname: stripIpv6Brackets(this.config.upstreamOrigin.hostname),
+          port: Number(this.config.upstreamOrigin.port),
+          method: 'GET',
+          path: `${target.pathname}${target.search}`,
+          headers: {
+            host: this.config.upstreamOrigin.host,
+            accept: 'text/javascript',
+            'accept-encoding': 'identity',
+            ...(upstreamCookie === undefined ? {} : { cookie: upstreamCookie }),
+          },
+          agent: false,
+        })
+        upstreamRequest.setTimeout(this.config.upstreamTimeoutMs, () => {
+          upstreamRequest?.destroy(new Error('upstream timeout'))
+        })
+        upstreamRequest.once('response', resolve)
+        upstreamRequest.once('error', reject)
+        upstreamRequest.end()
+      })
+      if ((proxied.statusCode ?? 502) !== 200) throw new HttpError(502, 'upstream_unavailable')
+      const chunks: Buffer[] = []
+      let bytes = 0
+      for await (const chunk of proxied) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        bytes += buffer.byteLength
+        if (bytes > MAX_MOBILE_BOOT_ENTRY_BYTES) throw new HttpError(502, 'upstream_unavailable')
+        chunks.push(buffer)
+      }
+      return Buffer.concat(chunks)
+    } catch (error) {
+      if (error instanceof HttpError) throw error
+      throw new HttpError(502, 'upstream_unavailable')
+    } finally {
+      signal.removeEventListener('abort', aborted)
+      upstreamRequest?.destroy()
+    }
+  }
+
+  private allocateRequest(
+    authorization: SessionAuthorization,
+    response: ServerResponse,
+    upstream: { request?: ClientRequest },
+  ): { id: number; signal: AbortSignal; release: () => void } {
+    if (this.activeRequests.size >= this.config.maxActiveRequests) throw new HttpError(429, 'busy')
+    const id = this.nextOperationId++
+    const controller = new AbortController()
+    const abort = (): void => {
+      controller.abort()
+      upstream.request?.destroy()
+      if (!response.destroyed) response.destroy()
+    }
+    const abortDelay = Number.isFinite(authorization.expiresAt)
+      ? Math.min(MAX_TIMER_DELAY_MS, Math.max(1, authorization.expiresAt - Date.now()))
+      : 0
+    const timer = abortDelay > 0 ? setTimeout(abort, abortDelay) : undefined
+    if (timer !== undefined) timer.unref()
+    this.activeRequests.set(id, Object.freeze({ ...authorization, abort, timer }))
+    return {
+      id,
+      signal: controller.signal,
+      release: () => {
+        const entry = this.activeRequests.get(id)
+        if (entry !== undefined && entry.timer !== undefined) clearTimeout(entry.timer)
+        this.activeRequests.delete(id)
+      },
+    }
+  }
+
+  private async proxyHttp(
+    request: IncomingMessage,
+    response: ServerResponse,
+    authorization: SessionAuthorization,
+  ): Promise<void> {
+    const declared = request.headers['content-length']
+    if (declared !== undefined && (!/^\d+$/u.test(declared) || Number(declared) > this.config.maxBodyBytes)) {
+      throw new HttpError(413, 'payload_too_large')
+    }
+    const holder: { request?: ClientRequest } = {}
+    const operation = this.allocateRequest(authorization, response, holder)
+    let bodyDone: Promise<void> | undefined
+    try {
+      const clamped = request.method === 'POST' && request.url?.split('?', 1)[0] === HISTORY_PAGE_PATH
+        ? clampHistoryPageBody(await readBoundedBody(request, this.config.maxBodyBytes), this.historyPages)
+        : undefined
+      const upstreamHeaders = sanitizeRequestHeaders(request, this.config.upstreamOrigin)
+      const upstreamCookie = await this.upstreamCookieHeader()
+      if (upstreamCookie !== undefined) upstreamHeaders.cookie = upstreamCookie
+      if (clamped !== undefined) upstreamHeaders['content-length'] = String(clamped.body.byteLength)
+      const upstreamResponse = new Promise<IncomingMessage>((resolve, reject) => {
+        const upstreamRequest = requestHttp({
+          protocol: 'http:',
+          hostname: stripIpv6Brackets(this.config.upstreamOrigin.hostname),
+          port: Number(this.config.upstreamOrigin.port),
+          method: request.method,
+          path: request.url,
+          headers: upstreamHeaders,
+          agent: false,
+        })
+        holder.request = upstreamRequest
+        upstreamRequest.setTimeout(this.config.upstreamTimeoutMs, () => {
+          upstreamRequest.destroy(new Error('upstream timeout'))
+        })
+        upstreamRequest.once('response', resolve)
+        upstreamRequest.once('error', reject)
+        if (clamped === undefined) {
+          bodyDone = pipeline(request, new ByteLimitTransform(this.config.maxBodyBytes), upstreamRequest)
+        } else {
+          upstreamRequest.end(clamped.body)
+          bodyDone = Promise.resolve()
+        }
+        void bodyDone.catch(reject)
+      })
+      const proxied = await upstreamResponse
+      setSecurityHeaders(response, this.tlsEnabled)
+      const headers = sanitizeResponseHeaders(proxied.headers, this.config.upstreamOrigin)
+      const cacheControl = revisionedStaticCacheControl(request)
+      if (cacheControl !== undefined) headers['cache-control'] = cacheControl
+      const compressed = shouldCompressResponse(request, proxied)
+      if (compressed) {
+        delete headers['accept-ranges']
+        delete headers['content-length']
+        delete headers.etag
+        headers['content-encoding'] = 'gzip'
+        addVaryAcceptEncoding(headers)
+      }
+      response.writeHead(proxied.statusCode ?? 502, headers)
+      await Promise.all([
+        bodyDone,
+        compressed ? pipeline(proxied, createGzip(), response) : pipeline(proxied, response),
+      ])
+    } catch (error) {
+      holder.request?.destroy()
+      await bodyDone?.catch(() => undefined)
+      if (error instanceof HttpError) throw error
+      if (response.headersSent) response.destroy()
+      else throw new HttpError(502, 'upstream_unavailable')
+    } finally {
+      operation.release()
+    }
+  }
+
+  private abortSessionResources(sessionKey: string): void {
+    for (const request of this.activeRequests.values()) {
+      if (request.sessionKey === sessionKey) request.abort()
+    }
+    for (const socket of this.activeWebSockets.values()) {
+      if (socket.sessionKey === sessionKey) {
+        socket.client.destroy()
+        socket.upstream.destroy()
+      }
+    }
+  }
+
+  private async readUpgradeResponse(upstream: Socket, expectedAccept: string, deflate: boolean): Promise<{ header: string; remainder: Buffer }> {
+    return new Promise((resolve, reject) => {
+      let buffer = Buffer.alloc(0)
+      const failed = (error: Error): void => { cleanup(); reject(error) }
+      const closed = (): void => { cleanup(); reject(new Error('upstream closed during WebSocket handshake')) }
+      const data = (chunk: Buffer): void => {
+        buffer = Buffer.concat([buffer, chunk])
+        if (buffer.length > MAX_HEADER_BYTES) {
+          failed(new Error('upstream WebSocket headers are too large'))
+          return
+        }
+        const end = buffer.indexOf('\r\n\r\n')
+        if (end < 0) return
+        cleanup()
+        const lines = buffer.subarray(0, end).toString('latin1').split('\r\n')
+        if (lines.shift() !== 'HTTP/1.1 101 Switching Protocols') {
+          reject(new Error('upstream refused WebSocket upgrade'))
+          return
+        }
+        const selected = new Map<string, string>()
+        for (const line of lines) {
+          const colon = line.indexOf(':')
+          if (colon <= 0) {
+            reject(new Error('upstream returned malformed WebSocket headers'))
+            return
+          }
+          const name = line.slice(0, colon).trim().toLowerCase()
+          const value = line.slice(colon + 1).trim()
+          if (selected.has(name)) {
+            reject(new Error('upstream returned duplicate WebSocket headers'))
+            return
+          }
+          selected.set(name, value)
+        }
+        if (selected.get('upgrade')?.toLowerCase() !== 'websocket'
+          || !hasToken(selected.get('connection'), 'upgrade')
+          || selected.get('sec-websocket-accept') !== expectedAccept) {
+          reject(new Error('upstream returned an invalid WebSocket handshake'))
+          return
+        }
+        const output = [
+          'HTTP/1.1 101 Switching Protocols',
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          `Sec-WebSocket-Accept: ${expectedAccept}`,
+        ]
+        const protocol = selected.get('sec-websocket-protocol')
+        const extensions = selected.get('sec-websocket-extensions')
+        if (protocol !== undefined) output.push(`Sec-WebSocket-Protocol: ${protocol}`)
+        // The offer was never passed upstream, so any upstream extension would
+        // be a surprise; ours is only advertised while the upstream has none.
+        if (extensions !== undefined) output.push(`Sec-WebSocket-Extensions: ${extensions}`)
+        else if (deflate) output.push(`Sec-WebSocket-Extensions: ${DEFLATE_EXTENSION}`)
+        output.push('Referrer-Policy: no-referrer', 'X-Content-Type-Options: nosniff', '', '')
+        resolve({ header: output.join('\r\n'), remainder: buffer.subarray(end + 4) })
+      }
+      const cleanup = (): void => {
+        upstream.off('data', data)
+        upstream.off('error', failed)
+        upstream.off('close', closed)
+      }
+      upstream.on('data', data)
+      upstream.once('error', failed)
+      upstream.once('close', closed)
+    })
+  }
+
+  private async handleUpgrade(request: IncomingMessage, client: Socket, head: Buffer): Promise<void> {
+    const target = parseRequestTarget(request.url)
+    const policy = this.requirePolicy()
+    // Android WebView WebSockets do not consistently carry Fetch Metadata.
+    // Exact Origin, direct CIDR, exact Host, and the short Session Cookie
+    // remain mandatory; when Sec-Fetch-Site is present, assertExternalTrust
+    // still requires it to be same-origin.
+    assertExternalTrust(request, policy, false)
+    if (!policy.acceptsOrigin(request.headers.origin)) throw new HttpError(403, 'forbidden')
+    if (target.search !== '' || !isAllowedWebSocketPath(target.decodedPathname)) throw new HttpError(404, 'not_found')
+    if (request.method !== 'GET' || headerValue(request.headers, 'upgrade')?.toLowerCase() !== 'websocket'
+      || !hasToken(headerValue(request.headers, 'connection'), 'upgrade')) {
+      throw new HttpError(400, 'bad_request')
+    }
+    const key = headerValue(request.headers, 'sec-websocket-key')
+    if (key === undefined || headerValue(request.headers, 'sec-websocket-version') !== '13') {
+      throw new HttpError(400, 'bad_request')
+    }
+    let decodedKey: Buffer
+    try {
+      decodedKey = Buffer.from(key, 'base64')
+    } catch {
+      throw new HttpError(400, 'bad_request')
+    }
+    if (decodedKey.length !== 16 || decodedKey.toString('base64') !== key) throw new HttpError(400, 'bad_request')
+    const authorization = this.authorize(request)
+    if (this.activeWebSockets.size >= this.config.maxWebSockets) throw new HttpError(429, 'busy')
+    const upstreamCookie = await this.upstreamCookieHeader()
+
+    const upstream = connect({
+      host: stripIpv6Brackets(this.config.upstreamOrigin.hostname),
+      port: Number(this.config.upstreamOrigin.port),
+    })
+    client.pause()
+    const id = this.nextOperationId++
+    const closeBoth = (): void => {
+      client.destroy()
+      upstream.destroy()
+    }
+    client.on('error', closeBoth)
+    upstream.on('error', closeBoth)
+    const timer = setTimeout(closeBoth, Math.min(MAX_TIMER_DELAY_MS, Math.max(1, authorization.expiresAt - Date.now())))
+    timer.unref()
+    const record: ActiveWebSocket = Object.freeze({ ...authorization, client, upstream, timer })
+    this.activeWebSockets.set(id, record)
+    const cleanup = (): void => {
+      const active = this.activeWebSockets.get(id)
+      if (active !== undefined) clearTimeout(active.timer)
+      this.activeWebSockets.delete(id)
+    }
+    client.once('close', () => { upstream.destroy(); cleanup() })
+    upstream.once('close', () => { client.destroy(); cleanup() })
+    upstream.setTimeout(this.config.upstreamTimeoutMs, closeBoth)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const connected = (): void => {
+          upstream.off('error', failed)
+          resolve()
+        }
+        const failed = (error: Error): void => {
+          upstream.off('connect', connected)
+          reject(error)
+        }
+        upstream.once('connect', connected)
+        upstream.once('error', failed)
+      })
+      const requestLines = [
+        `GET ${target.raw} HTTP/1.1`,
+        `Host: ${this.config.upstreamOrigin.host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Origin: ${this.config.upstreamOrigin.origin}`,
+        'Sec-Fetch-Site: same-origin',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+      ]
+      if (upstreamCookie !== undefined) requestLines.push(`Cookie: ${upstreamCookie}`)
+      const protocol = headerValue(request.headers, 'sec-websocket-protocol')
+      if (protocol !== undefined) requestLines.push(`Sec-WebSocket-Protocol: ${protocol}`)
+      // The client's `Sec-WebSocket-Extensions` is deliberately not forwarded:
+      // the upstream mux must stay plain, and the gateway accepts the offer on
+      // its own behalf (see the 101 response below).
+      const deflate = offersPerMessageDeflate(headerValue(request.headers, 'sec-websocket-extensions'))
+      requestLines.push('', '')
+      upstream.write(requestLines.join('\r\n'))
+      const handshake = await this.readUpgradeResponse(upstream, websocketAccept(key), deflate)
+      upstream.setTimeout(0)
+      client.write(handshake.header)
+      if (handshake.remainder.length > 0) client.write(handshake.remainder)
+      relayUpgradedWebSocket(client, upstream, head, { deflate })
+    } catch (error) {
+      closeBoth()
+      if (error instanceof HttpError) throw error
+      throw new HttpError(502, 'upstream_unavailable')
+    }
+  }
+
+  /** Loopback-only DSH WebServer route for opening pairing and managing devices. */
+  localAdminRoute(prefix: string = LOCAL_ADMIN_PREFIX): WebRoute {
+    return {
+      kind: 'prefix',
+      path: prefix,
+      handler: async (request, response) => {
+        try {
+          const target = parseRequestTarget(request.url)
+          const mutation = request.method === 'POST'
+          assertLocalAdminTrust(request, mutation)
+          if (target.search !== '') throw new HttpError(400, 'bad_request')
+          if (request.method === 'GET' && target.decodedPathname === `${prefix}/status`) {
+            sendJson(response, 200, {
+              gateway: this.address(),
+              pairing: this.access.pairingStatus(),
+              deviceCount: this.access.listDevices().length,
+              resources: {
+                connections: this.connectedSockets.size,                activeRequests: this.activeRequests.size,
+                webSockets: this.activeWebSockets.size,
+              },
+            }, false)
+            return
+          }
+          if (request.method === 'GET' && target.decodedPathname === `${prefix}/devices`) {
+            sendJson(response, 200, { devices: this.access.listDevices() }, false)
+            return
+          }
+          if (request.method === 'POST' && target.decodedPathname === `${prefix}/pairing/open`) {
+            const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+            if (body.ttlMs !== undefined && typeof body.ttlMs !== 'number') throw new HttpError(400, 'bad_request')
+            const opened = await this.access.openPairing(body.ttlMs as number | undefined)
+            const pairUrl = `${this.address().origin}/mobile-access/pair#instance=${this.config.instanceId}&token=${opened.token}`
+            const appPairUrl = pairUrl
+            // The QR code is an enhancement; a failed render must not waste an opened window.
+            let qrSvg = ''
+            try {
+              qrSvg = await QRCode.toString(appPairUrl, { type: 'svg', margin: 1 })
+            } catch {
+              // keep qrSvg empty
+            }
+            sendJson(response, 201, {
+              ...opened,
+              appKey: `dsh1.${this.config.instanceId}.${opened.token}`,
+              pairUrl,
+              appPairUrl,
+              qrSvg,
+            }, false)
+            return
+          }
+          if (request.method === 'POST' && target.decodedPathname === `${prefix}/devices/revoke`) {
+            const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+            if (typeof body.deviceId !== 'string' || !/^[a-f\d]{32}$/u.test(body.deviceId)) {
+              throw new HttpError(400, 'bad_request')
+            }
+            const revoked = await this.access.revokeDevice(body.deviceId)
+            if (!revoked) throw new HttpError(404, 'not_found')
+            sendJson(response, 200, { revoked: true }, false)
+            return
+          }
+          if (request.method === 'POST' && target.decodedPathname === `${prefix}/devices/reset`) {
+            const body = await readJsonObject(request, MAX_CONTROL_BODY_BYTES)
+            if (body.confirm !== true) throw new HttpError(400, 'bad_request')
+            await this.access.resetDevices()
+            sendJson(response, 200, { reset: true }, false)
+            return
+          }
+          throw new HttpError(404, 'not_found')
+        } catch (error) {
+          const mapped = mapError(error)
+          if (response.headersSent) response.destroy()
+          else sendFailure(response, mapped.status, mapped.code, false)
+        }
+      },
+    }
+  }
+
+  /**
+   * Pairing-free mobile-frontend route for the remote (Tailscale Serve)
+   * channel. The LAN gateway serves these assets behind its own device
+   * pairing; the remote channel's access control is tailnet membership, so
+   * the DSH WebServer (reachable from the phone through the passthrough
+   * proxy) serves the same metadata, custom css/js, mobile layout module and
+   * extension registry without a paired-device cookie. Extension actions and
+   * routes keep their host-side checks via a synthetic guest authorization.
+   */
+  mobileFrontendRoute(): WebRoute {
+    const guest: SessionAuthorization = Object.freeze({
+      sessionKey: 'remote',
+      deviceId: 'remote',
+      // A finite far-future expiry: the allocateRequest abort timer derives
+      // from it, and a non-finite value would leave the deadline disabled.
+      // Note this is 30 days, which exceeds the 32-bit setTimeout range, so
+      // both timer sites clamp the derived delay to MAX_TIMER_DELAY_MS instead
+      // of letting setTimeout truncate the overflow to 1 ms.
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    })
+    return {
+      kind: 'prefix',
+      path: AUTH_PREFIX,
+      handler: async (request, response) => {
+        try {
+          const target = parseRequestTarget(request.url)
+          if (target.search === '' && request.method === 'GET' && target.decodedPathname === `${AUTH_PREFIX}/metadata`) {
+            sendJson(response, 200, {
+              version: MOBILE_METADATA_VERSION,
+              pluginVersion: DSH_ON_PHONE_VERSION,
+              minimumAndroidAppVersion: MINIMUM_ANDROID_APP_VERSION,
+              discoveryProtocol: DISCOVERY_PROTOCOL,
+            }, false)
+            return
+          }
+          const customAsset = request.method === 'GET'
+            ? target.decodedPathname === `${AUTH_PREFIX}/custom.css`
+              ? {
+                  file: this.config.customCssFile,
+                  contentType: 'text/css; charset=utf-8',
+                  fallback: CUSTOM_STYLE_FALLBACK,
+                }
+              : target.decodedPathname === `${AUTH_PREFIX}/custom.js`
+                ? {
+                    file: this.config.customScriptFile,
+                    contentType: 'text/javascript; charset=utf-8',
+                    fallback: CUSTOM_SCRIPT_FALLBACK,
+                  }
+                : target.decodedPathname === MOBILE_LAYOUT_PATH
+                  ? {
+                      file: this.config.mobileLayoutFile,
+                      contentType: 'text/javascript; charset=utf-8',
+                      fallback: undefined,
+                    }
+                  : undefined
+            : undefined
+          const requestedExtension = extensionTarget(target.decodedPathname)
+          const requestedMobileBootBatch = mobileBootBatchKey(target.decodedPathname)
+          if (customAsset === undefined && requestedExtension === undefined && requestedMobileBootBatch === undefined) {
+            throw new HttpError(404, 'not_found')
+          }
+          if (requestedExtension !== undefined) {
+            await this.handleExtensionRequest(requestedExtension, target, request, response, guest)
+            return
+          }
+          if (requestedMobileBootBatch !== undefined) {
+            await this.serveMobileBootBatch(requestedMobileBootBatch, request, response, guest)
+            return
+          }
+          const operation = this.allocateRequest(guest, response, {})
+          try {
+            let body: Buffer
+            let mtime: Date | undefined
+            try {
+              body = await readFile(customAsset!.file, { signal: operation.signal })
+              try {
+                const fileStat = await stat(customAsset!.file)
+                mtime = fileStat.mtime
+              } catch { /* keep undefined */ }
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+              if (customAsset!.fallback === undefined) throw new HttpError(503, 'mobile_frontend_unavailable')
+              body = Buffer.from(customAsset!.fallback)
+            }
+            if (body.byteLength > 256 * 1024) throw new HttpError(413, 'payload_too_large')
+            const etag = createHash('sha256').update(body).digest('hex')
+            if (headerValue(request.headers, 'if-none-match') === etag) {
+              setSecurityHeaders(response, false)
+              response.writeHead(304)
+              response.end()
+              return
+            }
+            setSecurityHeaders(response, false)
+            const responseHeaders: Record<string, string | number> = {
+              'Content-Type': customAsset!.contentType,
+              'Content-Length': body.byteLength,
+              'ETag': etag,
+            }
+            if (mtime !== undefined) responseHeaders['Last-Modified'] = mtime.toUTCString()
+            response.writeHead(200, responseHeaders)
+            if (request.method === 'HEAD') response.end()
+            else response.end(body)
+          } finally {
+            operation.release()
+          }
+        } catch (error) {
+          const detail = error instanceof Error ? ` (${error.message})` : ''
+          process.stderr.write(`[dsh-on-phone] mobile frontend route failed for ${request.method ?? '?'} ${request.url}: ${error instanceof HttpError ? error.code : 'internal_error'}${detail}\n`)
+          const mapped = mapError(error)
+          if (response.headersSent) response.destroy()
+          else sendFailure(response, mapped.status, mapped.code, false)
+        }
+      },
+    }
+  }
+
+  /** Close listeners and abort all accepted work before resolving teardown. */
+  async close(): Promise<void> {
+    if (this.closeTask !== undefined) return this.closeTask
+    this.closeTask = this.performClose()
+    return this.closeTask
+  }
+
+  private async performClose(): Promise<void> {
+    this.closing = true
+    this.upstreamAuthRequest?.destroy()
+    this.upstreamAuthRequest = undefined
+    this.removeSessionListener()
+    const accessClose = this.access.close()
+    for (const request of this.activeRequests.values()) request.abort()
+    for (const websocket of this.activeWebSockets.values()) {
+      websocket.client.destroy()
+      websocket.upstream.destroy()
+    }
+    for (const socket of this.connectedSockets) socket.destroy()
+    if (this.discoveryTimer !== undefined) clearInterval(this.discoveryTimer)
+    this.discoveryTimer = undefined
+    await this.closeBonjour()
+    const discoverySocket = this.discoverySocket
+    this.discoverySocket = undefined
+    if (discoverySocket !== undefined) {
+      await new Promise<void>(resolve => { discoverySocket.close(() => resolve()) })
+    }
+    const server = this.server
+    this.server = undefined
+    if (server !== undefined && server.listening) {
+      server.closeAllConnections()
+      await new Promise<void>(resolve => { server.close(() => resolve()) })
+    }
+    await accessClose
+    this.activeRequests.clear()
+    this.activeWebSockets.clear()
+    this.connectedSockets.clear()
+    this.policy = undefined
+    this.listenerPort = undefined
+  }
+
+  /** Safe metadata helper for direct loopback integrations. */
+  devices(): readonly DeviceSummary[] {
+    return this.access.listDevices()
+  }
+
+  /** Status shown by the loopback mobile-access control card. */
+  extensionStatus(): { readonly loaded: number; readonly failed: number } {
+    return this.extensions?.status() ?? { loaded: 0, failed: 0 }
+  }
+}
