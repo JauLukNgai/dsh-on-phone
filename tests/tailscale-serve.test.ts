@@ -7,26 +7,27 @@ import type { RemotePassthroughProxy } from '../src/remote-proxy.js'
 import { TailscaleServeController, normalizeServeOrigin, serveEntryTargetsProxy } from '../src/tailscale-serve.js'
 
 /**
- * Write an executable the controller can spawn on this host.
+ * Write a fake the controller can spawn on this host.
  *
- * `execFile` cannot run a `#!/bin/sh` script on Windows, so the Windows run gets
- * the same fake written as a Node script plus a `.cmd` shim beside it; both take
- * the same arguments and print the same lines on stdout.
+ * `execFile` on Windows refuses a `.cmd` shim without a shell, and a `#!/bin/sh`
+ * script cannot run there at all, so the fake is written twice: a POSIX script
+ * that carries the shebang, and a plain Node script that the Windows run drives
+ * by putting the interpreter in front of it. Both take the same arguments and
+ * print the same lines on stdout.
  * @param directory - Directory that owns the fake.
  * @param body - The fake in two dialects: `sh` is a POSIX script body, `node` is the same fake as a Node module body.
- * @returns The path to pass to the controller as `bin`.
+ * @returns What to pass to the controller as `bin`: a path, or an interpreter plus a path.
  */
 async function writeFakeExecutable(
   directory: string,
   body: { readonly sh: readonly string[]; readonly node: readonly string[] },
-): Promise<string> {
+): Promise<string | readonly string[]> {
   const posixBin = join(directory, 'tailscale')
   await writeFile(posixBin, [...body.sh, ''].join('\n'), 'utf8')
   await chmod(posixBin, 0o755)
-  const windowsBin = join(directory, 'tailscale.cmd')
-  await writeFile(windowsBin, ['@echo off', 'node "%~dp0tailscale-fake.mjs" %*', ''].join('\r\n'), 'utf8')
-  await writeFile(join(directory, 'tailscale-fake.mjs'), [...body.node, ''].join('\n'), 'utf8')
-  return process.platform === 'win32' ? windowsBin : posixBin
+  const nodeBin = join(directory, 'tailscale-fake.mjs')
+  await writeFile(nodeBin, [...body.node, ''].join('\n'), 'utf8')
+  return process.platform === 'win32' ? [process.execPath, nodeBin] : posixBin
 }
 
 /**
@@ -45,7 +46,7 @@ async function fakeTailscale(
   statusJson: unknown,
   options: { readonly serveStatus?: unknown; readonly failApply?: boolean } = {},
 ): Promise<{
-  readonly bin: string
+  readonly bin: string | readonly string[]
   readonly calls: () => Promise<string[]>
   readonly serveState: string
   readonly writeServeStatus: (status: unknown) => Promise<void>

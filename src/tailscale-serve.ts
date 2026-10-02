@@ -19,11 +19,10 @@
  * @module dsh-on-phone/tailscale-serve
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, type ExecFileOptions } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { posix, win32 } from 'node:path'
-import { promisify } from 'node:util'
 import type { MobileAccessControlStore } from './control.js'
 import type { RemotePassthroughProxy } from './remote-proxy.js'
 
@@ -43,12 +42,18 @@ export interface TailscaleServeControllerOptions {
   readonly store: MobileAccessControlStore
   /** Loopback proxy exposing the live DSH web upstream behind the serve origin. */
   readonly proxy: RemotePassthroughProxy
-  /** tailscale CLI binary name or absolute path; defaults to PATH resolution. */
-  readonly bin?: string
+  /**
+   * tailscale CLI binary name or absolute path; defaults to PATH resolution.
+   *
+   * A string is one executable; an array is an executable plus the arguments it
+   * is always spawned with. The array form exists for a platform whose CLI is
+   * not a native executable — a Windows `.cmd` shim, or a script that has to be
+   * run through an interpreter — so it can still be driven through `execFile`
+   * without a shell.
+   */
+  readonly bin?: string | readonly string[]
   readonly onStatus?: (status: TailscaleServeStatus) => void
 }
-
-const execFileAsync = promisify(execFile)
 
 /** Environment escape hatch for a Tailscale install in an unusual location. */
 const TAILSCALE_BIN_ENV = 'DSH_ON_PHONE_TAILSCALE_BIN'
@@ -329,14 +334,29 @@ export class TailscaleServeController {
     }
   }
 
-  private bin(): string {
+  private bin(): readonly string[] {
     // Resolved per invocation, not once at construction: a host that resolves it
     // on first use keeps working when the user installs Tailscale after starting
     // DSH, instead of reporting tailscale_missing until the next restart.
-    return (
-      this.options.bin ??
-      resolveTailscaleBinary({ platform: process.platform, env: process.env, home: homedir(), exists: existsSync })
-    )
+    const configured = this.options.bin
+    if (configured !== undefined) return typeof configured === 'string' ? [configured] : configured
+    return [resolveTailscaleBinary({ platform: process.platform, env: process.env, home: homedir(), exists: existsSync })]
+  }
+
+  /**
+   * Run one tailscale subcommand, prepending however the CLI has to be spawned.
+   * @param subcommand - Arguments after the executable.
+   * @param options - Spawn options, always including the shared timeout.
+   * @returns The child's stdout.
+   */
+  private async execTailscale(subcommand: readonly string[], options: ExecFileOptions): Promise<string> {
+    return await new Promise<string>((resolve, reject) => {
+      const [file, ...prefix] = this.bin()
+      execFile(file ?? 'tailscale', [...prefix, ...subcommand], options, (error, stdout) => {
+        if (error === null) resolve(String(stdout))
+        else reject(error)
+      })
+    })
   }
 
   private async start(): Promise<void> {
@@ -398,7 +418,7 @@ export class TailscaleServeController {
   /** Parsed `serve status --json`, or undefined when it cannot be read. */
   private async readServeEntries(): Promise<unknown | undefined> {
     try {
-      const { stdout } = await execFileAsync(this.bin(), [...SERVE_STATUS_ARGS], {
+      const stdout = await this.execTailscale([...SERVE_STATUS_ARGS], {
         windowsHide: true,
         timeout: 30_000,
       })
@@ -409,7 +429,7 @@ export class TailscaleServeController {
   }
 
   private async applyServe(target: string): Promise<void> {
-    await execFileAsync(this.bin(), ['serve', '--bg', '--yes', '--https=443', target], {
+    await this.execTailscale(['serve', '--bg', '--yes', '--https=443', target], {
       windowsHide: true,
       timeout: 30_000,
     })
@@ -423,7 +443,7 @@ export class TailscaleServeController {
   private async recoverServePortConflict(): Promise<void> {
     let status: unknown
     try {
-      const { stdout } = await execFileAsync(this.bin(), ['serve', 'status', '--json'], {
+      const stdout = await this.execTailscale(['serve', 'status', '--json'], {
         windowsHide: true,
         timeout: 30_000,
       })
@@ -436,7 +456,7 @@ export class TailscaleServeController {
     if (entries.length !== 1 || entries[0] !== '443') {
       throw new ServeDiagnosticError('serve_port_conflict', 'serve port 443 is occupied by another service')
     }
-    await execFileAsync(this.bin(), ['serve', 'reset'], {
+    await this.execTailscale(['serve', 'reset'], {
       windowsHide: true,
       timeout: 30_000,
     })
@@ -455,7 +475,7 @@ export class TailscaleServeController {
       const status = await this.readServeEntries()
       if (status === undefined || serveEntryTargetsProxy(status, target)) {
         try {
-          await execFileAsync(this.bin(), ['serve', '--https=443', 'off'], {
+          await this.execTailscale(['serve', '--https=443', 'off'], {
             windowsHide: true,
             timeout: 30_000,
           })
@@ -477,7 +497,7 @@ export class TailscaleServeController {
   }
 
   private async resolveOrigin(): Promise<string> {
-    const { stdout } = await execFileAsync(this.bin(), ['status', '--json'], {
+    const stdout = await this.execTailscale(['status', '--json'], {
       windowsHide: true,
       timeout: 30_000,
     })
