@@ -61,7 +61,7 @@
 
 两种装法，选一种：
 
-**1. npm 安装**（发布后可用）
+**1. npm 安装**（推荐）
 
 ```bash
 dsh plugin --profile web add dsh-on-phone@latest
@@ -69,7 +69,7 @@ dsh plugin --profile web add dsh-on-phone@latest
 
 Desktop 用不上命令，在 **添加插件** 里填包名 `dsh-on-phone` 即可。
 
-**2. 源码安装**（暂未发布时用；需要 Node `^22.19.0 || >=24.0.0`）
+**2. 源码安装**（想改代码或锁定某个提交时用；需要 Node `^22.19.0 || >=24.0.0`）
 
 ```bash
 git clone https://github.com/JauLukNgai/dsh-on-phone.git && cd dsh-on-phone

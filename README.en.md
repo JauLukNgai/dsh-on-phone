@@ -61,7 +61,7 @@ Both live on the admin console's [DNS page](https://login.tailscale.com/admin/dn
 
 Two ways to install, pick one:
 
-**1. From npm** (available once published)
+**1. From npm** (recommended)
 
 ```bash
 dsh plugin --profile web add dsh-on-phone@latest
@@ -69,7 +69,7 @@ dsh plugin --profile web add dsh-on-phone@latest
 
 Desktop needs no command — put the package name `dsh-on-phone` in **Add plugin**.
 
-**2. From source** (while it is unpublished; Node `^22.19.0 || >=24.0.0` required)
+**2. From source** (to edit the code or pin a commit; Node `^22.19.0 || >=24.0.0` required)
 
 ```bash
 git clone https://github.com/JauLukNgai/dsh-on-phone.git && cd dsh-on-phone
