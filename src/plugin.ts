@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm/message'
+import { boundContextSummary, createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm/message'
 // Side-effect type import: activates dsh-commands' Context augmentation so
 // `ctx.commands` and its handler types resolve without a runtime dependency.
 import type {} from '@deepseek-ai/dsh-commands'
@@ -41,6 +41,18 @@ import {
   selectLanNetwork,
   type ManagedSetup,
 } from './managed-setup.js'
+
+// The Host's message-source vocabulary is merge-extensible: every producer
+// declares its own `kind` in its own module (upstream's webhook, schedule, and
+// cordis-host-runner do exactly this). 0.2.0-rc.2 dropped the old shared
+// `plugin` kind, so this plugin declares its own — which also labels the
+// collapsed context row after the plugin instead of after a generic kind.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** One `/mobile` request handed to the agent as plugin context, not as a user bubble. */
+    'dsh-on-phone': { readonly kind: 'dsh-on-phone' } & ContextFormed
+  }
+}
 
 /** Stable Cordis plugin name. */
 export const name = 'dsh-on-phone'
@@ -419,8 +431,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         agent.steer(createUserMessage({
           content: [{ type: 'text', text: `${MOBILE_CUSTOMIZATION_GUIDE}\n\n用户需求：${task}` }],
           source: {
-            kind: 'plugin',
-            plugin: 'dsh-on-phone',
+            kind: 'dsh-on-phone',
             form: 'notice',
             summary: boundContextSummary(`/mobile ${task}`),
           },

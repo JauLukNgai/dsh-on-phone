@@ -169,8 +169,7 @@ describe('stock DSH lifecycle', () => {
     expect(steeredMessage!.text).toContain('make the phone UI dark')
     // The guide rides as a plugin-source context injection, not a user bubble.
     expect(steeredMessage!.source).toMatchObject({
-      kind: 'plugin',
-      plugin: 'dsh-on-phone',
+      kind: 'dsh-on-phone',
       form: 'notice',
     })
   })

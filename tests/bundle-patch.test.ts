@@ -3,12 +3,13 @@ import { resolve } from 'node:path'
 import * as yaml from 'js-yaml'
 import { describe, expect, it } from 'vitest'
 
-const jsExpressionType = new yaml.Type('tag:yaml.org,2002:js', {
-  kind: 'scalar',
-  resolve: data => typeof data === 'string',
-  construct: data => ({ __jsExpr: data as string }),
+// js-yaml 5 replaced `new Type(...)` + `Schema.extend(...)` with a tag factory
+// and `Schema.withTags(...)`: one `resolve` both validates and constructs.
+const jsExpressionType = yaml.defineScalarTag<{ __jsExpr: string }>('tag:yaml.org,2002:js', {
+  resolve: source => ({ __jsExpr: source }),
+  identify: () => false,
 })
-const schema = yaml.JSON_SCHEMA.extend(jsExpressionType)
+const schema = yaml.JSON_SCHEMA.withTags(jsExpressionType)
 const source = readFileSync(resolve(import.meta.dirname, '..', 'cordis.patch.yml'), 'utf8')
 
 function record(value: unknown): Record<string, unknown> {
