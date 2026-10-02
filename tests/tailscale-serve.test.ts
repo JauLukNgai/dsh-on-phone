@@ -7,6 +7,29 @@ import type { RemotePassthroughProxy } from '../src/remote-proxy.js'
 import { TailscaleServeController, normalizeServeOrigin, serveEntryTargetsProxy } from '../src/tailscale-serve.js'
 
 /**
+ * Write an executable the controller can spawn on this host.
+ *
+ * `execFile` cannot run a `#!/bin/sh` script on Windows, so the Windows run gets
+ * the same fake written as a Node script plus a `.cmd` shim beside it; both take
+ * the same arguments and print the same lines on stdout.
+ * @param directory - Directory that owns the fake.
+ * @param body - The fake in two dialects: `sh` is a POSIX script body, `node` is the same fake as a Node module body.
+ * @returns The path to pass to the controller as `bin`.
+ */
+async function writeFakeExecutable(
+  directory: string,
+  body: { readonly sh: readonly string[]; readonly node: readonly string[] },
+): Promise<string> {
+  const posixBin = join(directory, 'tailscale')
+  await writeFile(posixBin, [...body.sh, ''].join('\n'), 'utf8')
+  await chmod(posixBin, 0o755)
+  const windowsBin = join(directory, 'tailscale.cmd')
+  await writeFile(windowsBin, ['@echo off', 'node "%~dp0tailscale-fake.mjs" %*', ''].join('\r\n'), 'utf8')
+  await writeFile(join(directory, 'tailscale-fake.mjs'), [...body.node, ''].join('\n'), 'utf8')
+  return process.platform === 'win32' ? windowsBin : posixBin
+}
+
+/**
  * Install a fake `tailscale` executable that records every invocation and keeps
  * a state file for `serve`, so the whole Serve lifecycle can be driven without
  * touching the real node.
@@ -30,25 +53,42 @@ async function fakeTailscale(
   const directory = await mkdtemp(join(tmpdir(), 'dsh-tailscale-'))
   const log = join(directory, 'calls.txt')
   const state = join(directory, 'serve.json')
-  const bin = join(directory, 'tailscale')
+  const bin = await writeFakeExecutable(directory, {
+    sh: [
+      '#!/bin/sh',
+      `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+      'case "$*" in',
+      `  "serve status --json") cat ${JSON.stringify(state)} 2>/dev/null || printf '%s' '{}' ;;`,
+      `  "serve --https=443 off") printf '%s' '{}' > ${JSON.stringify(state)} ;;`,
+      `  "serve reset") printf '%s' '{}' > ${JSON.stringify(state)} ;;`,
+      ...(options.failApply === true ? ['  "serve --bg "*) echo "Error: serve failed" >&2; exit 1 ;;'] : []),
+      '  "serve --bg --yes --https=443 "*)',
+      '    for last do :; done',
+      `    printf '{"TCP":{"443":{"HTTPS":true}},"Web":{"node.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"%s"}}}}}' "$last" > ${JSON.stringify(state)} ;;`,
+      `  *"status --json"*) printf '%s' ${JSON.stringify(JSON.stringify(statusJson))} ;;`,
+      'esac',
+      'exit 0',
+      '',
+    ],
+    node: [
+      `import { readFileSync, writeFileSync } from 'node:fs'`,
+      `const log = ${JSON.stringify(log)}`,
+      `const state = ${JSON.stringify(state)}`,
+      `const read = () => { try { return readFileSync(state, 'utf8') } catch { return '' } }`,
+      `const args = process.argv.slice(2)`,
+      `const line = args.join(' ')`,
+      `const statusJson = ${JSON.stringify(JSON.stringify(statusJson))}`,
+      `try { writeFileSync(log, line + '\\n', { flag: 'a' }) } catch {}`,
+      `if (line === 'serve status --json') { process.stdout.write(read() || '{}') }`,
+      `else if (line === 'serve --https=443 off' || line === 'serve reset') { writeFileSync(state, '{}') }`,
+      `else if (${options.failApply === true ? "line.startsWith('serve --bg ')" : 'false'}) { process.stderr.write('Error: serve failed\\n'); process.exit(1) }`,
+      `else if (line.startsWith('serve --bg --yes --https=443 ')) {`,
+      `  writeFileSync(state, JSON.stringify({ TCP: { 443: { HTTPS: true } }, Web: { 'node.tailnet.ts.net:443': { Handlers: { '/': { Proxy: args.at(-1) } } } } }))`,
+      `} else if (line.endsWith('status --json')) { process.stdout.write(statusJson) }`,
+      '',
+    ],
+  })
   await writeFile(state, JSON.stringify(options.serveStatus ?? {}), 'utf8')
-  await writeFile(bin, [
-    '#!/bin/sh',
-    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
-    'case "$*" in',
-    `  "serve status --json") cat ${JSON.stringify(state)} 2>/dev/null || printf '%s' '{}' ;;`,
-    `  "serve --https=443 off") printf '%s' '{}' > ${JSON.stringify(state)} ;;`,
-    `  "serve reset") printf '%s' '{}' > ${JSON.stringify(state)} ;;`,
-    ...(options.failApply === true ? ['  "serve --bg "*) echo "Error: serve failed" >&2; exit 1 ;;'] : []),
-    '  "serve --bg --yes --https=443 "*)',
-    '    for last do :; done',
-    `    printf '{"TCP":{"443":{"HTTPS":true}},"Web":{"node.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"%s"}}}}}' "$last" > ${JSON.stringify(state)} ;;`,
-    `  *"status --json"*) printf '%s' ${JSON.stringify(JSON.stringify(statusJson))} ;;`,
-    'esac',
-    'exit 0',
-    '',
-  ].join('\n'), 'utf8')
-  await chmod(bin, 0o755)
   return {
     bin,
     serveState: state,
@@ -145,19 +185,25 @@ describe('Tailscale Serve lifecycle', () => {
     // none of the message patterns the classifier looks for, so the panel used
     // to lose the actionable hint and show the generic code.
     const directory = await mkdtemp(join(tmpdir(), 'dsh-tailscale-conflict-'))
-    const bin = join(directory, 'tailscale')
-    await writeFile(bin, [
-      '#!/bin/sh',
-      'case "$*" in',
-      // 443 is occupied, and not as the sole entry, so the recovery path
-      // refuses to reset the config and raises its own diagnostic.
-      '  *"serve --bg"*) echo "Error: already serving TCP on port 443" >&2; exit 1 ;;',
-      '  *"serve status --json"*) printf \'%s\' \'{"TCP":{"443":{},"8443":{}}}\' ;;',
-      'esac',
-      'exit 0',
-      '',
-    ].join('\n'), 'utf8')
-    await chmod(bin, 0o755)
+    const bin = await writeFakeExecutable(directory, {
+      sh: [
+        '#!/bin/sh',
+        'case "$*" in',
+        // 443 is occupied, and not as the sole entry, so the recovery path
+        // refuses to reset the config and raises its own diagnostic.
+        '  *"serve --bg"*) echo "Error: already serving TCP on port 443" >&2; exit 1 ;;',
+        '  *"serve status --json"*) printf \'%s\' \'{"TCP":{"443":{},"8443":{}}}\' ;;',
+        'esac',
+        'exit 0',
+        '',
+      ],
+      node: [
+        `const line = process.argv.slice(2).join(' ')`,
+        `if (line.includes('serve --bg')) { process.stderr.write('Error: already serving TCP on port 443\\n'); process.exit(1) }`,
+        `if (line.includes('serve status --json')) { process.stdout.write('{"TCP":{"443":{},"8443":{}}}') }`,
+        '',
+      ],
+    })
 
     const { proxy } = await fakeProxy()
     const controller = new TailscaleServeController({ store: store(true), proxy, bin })

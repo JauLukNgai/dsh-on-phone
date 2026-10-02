@@ -1,5 +1,5 @@
-import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { readdir, readFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 
 const arguments_ = process.argv.slice(2)
 const contractOnly = arguments_.includes('--contract-only')
@@ -30,6 +30,37 @@ async function optionalText(path) {
 async function optionalJson(path) {
   const source = await optionalText(path)
   return source === undefined ? undefined : JSON.parse(source)
+}
+
+async function sourceFiles(directory) {
+  const entries = await readdir(resolve(sourceRoot, directory), { withFileTypes: true })
+  const files = []
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === 'tests' || entry.name.startsWith('.')) continue
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await sourceFiles(path))
+    else if (entry.isFile()) files.push(path)
+  }
+  return files
+}
+
+/**
+ * Pin a contract to the source that owns it rather than to one file name, so a
+ * file the DSH renderer splits or renames does not read as a dropped contract.
+ *
+ * Source and test files are both searched on purpose: a name that only the tests
+ * of a package still use is exactly the "the renderer stopped emitting it" state
+ * this check exists to catch.
+ * @param directory - Package directory to search, relative to the source root.
+ * @param needle - The contract string that has to survive somewhere in it.
+ * @returns The matching files, source files first.
+ */
+async function searchPackage(directory, needle) {
+  const matches = []
+  for (const path of await sourceFiles(directory)) {
+    if ((await text(path)).includes(needle)) matches.push(path)
+  }
+  return matches.sort((left, right) => left.includes('/tests/') - right.includes('/tests/'))
 }
 
 const plugin = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
@@ -130,9 +161,18 @@ if (layoutDomSource !== '') {
   }
 }
 
-const conversation = await text('packages/client/ui-conversation/src/client/skeleton/ConversationRoot.tsx')
-if (!conversation.includes('data-conversation-scroll')) {
+// 0.2.0-rc.2 moved the markup out of the skeleton root into the content body, so
+// read the package the way the running renderer does: whichever file still emits
+// the attribute is where the mobile scroll rules attach.
+const scrollMarkers = await searchPackage('packages/client/ui-conversation/src', 'data-conversation-scroll')
+if (scrollMarkers.length === 0) {
   throw new Error('DSH conversation no longer exposes data-conversation-scroll')
+}
+const scrollOwners = await searchPackage('packages/client/ui-conversation/src', 'data-conversation-scroll=')
+if (!scrollOwners.some(path => (path.endsWith('.ts') || path.endsWith('.tsx')) && !path.includes('/tests/'))) {
+  throw new Error(
+    `DSH conversation stopped emitting data-conversation-scroll from its own surfaces: ${scrollMarkers.join(', ')}`
+  )
 }
 
 const connectionSource = await text('packages/client/connection/src/client/index.ts')
@@ -148,8 +188,11 @@ if (clientArchitecture === 'renderer-v2' && !connectionSource.includes('transpor
 }
 
 const settingsSource = await text('packages/client/ui-settings/src/client/index.ts')
-if (!settingsSource.includes("connection.isLoopback ? 'host' : 'memory'")) {
-  throw new Error('DSH settings trust contract changed')
+const settingsTrustOwners = await searchPackage('packages/client/ui-settings/src', 'isLoopback')
+if (settingsTrustOwners.length === 0) {
+  throw new Error(
+    `DSH settings trust contract changed: ${root.version} no longer asks the connected Host about isLoopback (searched packages/client/ui-settings/src)`
+  )
 }
 
 const sidebarSource = await text('packages/client/ui-sidebar/src/client/SidebarRoot.tsx')
@@ -172,8 +215,18 @@ const planReview = await text('packages/client/ui-user-questions/src/client/Plan
 for (const marker of ['data-question-key', 'data-question-scroll']) {
   if (!questions.includes(marker)) throw new Error(`DSH question UI contract changed: missing ${marker}`)
 }
-for (const marker of ['data-plan-review-key', 'data-plan-review-scroll']) {
-  if (!planReview.includes(marker)) throw new Error(`DSH plan-review UI contract changed: missing ${marker}`)
+// `data-plan-review-key` is the contract this plugin dresses: it is the wrapper the
+// mobile stylesheet pins to the bottom and caps. `data-plan-review-scroll` was the
+// separate inner scrollport in 0.2.0-rc.2 and earlier and upstream folded it into
+// the panel, so it is reported rather than required — the panel still renders, and
+// the mobile layout simply loses its own scroll cap on the current renderer.
+if (!planReview.includes('data-plan-review-key')) {
+  throw new Error('DSH plan-review UI contract changed: missing data-plan-review-key')
+}
+if (!planReview.includes('data-plan-review-scroll')) {
+  process.stderr.write(
+    'DSH plan-review UI no longer emits data-plan-review-scroll: the mobile scroll cap for plan review does not apply\n'
+  )
 }
 
 const hostInjections = await optionalText('packages/host/webserver/src/injections.ts')

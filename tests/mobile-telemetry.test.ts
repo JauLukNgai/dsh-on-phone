@@ -15,8 +15,8 @@ const scratch = async (): Promise<string> => await mkdtemp(join(tmpdir(), 'dsh-t
 
 describe('mobile telemetry destination', () => {
   it('lives inside the DSH home', () => {
-    expect(telemetryFile({ DSH_HOME: '/data/dsh' }, '/home/phone')).toBe('/data/dsh/mobile-telemetry.jsonl')
-    expect(telemetryFile({ DSH_HOME: '' }, '/home/phone')).toBe('/home/phone/.dsh/mobile-telemetry.jsonl')
+    expect(telemetryFile({ DSH_HOME: '/data/dsh' }, '/home/phone')).toBe(join('/data/dsh', 'mobile-telemetry.jsonl'))
+    expect(telemetryFile({ DSH_HOME: '' }, '/home/phone')).toBe(join('/home/phone', '.dsh', 'mobile-telemetry.jsonl'))
   })
 
   it('is a path the remote proxy can claim without shadowing the admin surface', () => {
