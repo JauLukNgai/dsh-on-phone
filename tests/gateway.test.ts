@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { connect, type AddressInfo, type Socket } from 'node:net'
 import { gunzipSync } from 'node:zlib'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { parseGatewayConfig } from '../src/config.js'
 import { MobileAccessGateway } from '../src/gateway.js'
 import { CSRF_HEADER, DEVICE_COOKIE, SESSION_COOKIE } from '../src/http-security.js'
@@ -30,8 +30,8 @@ interface UpstreamObservation {
 }
 
 const cleanups: Array<() => Promise<void>> = []
-const TEST_GATEWAY_PORT = 38080
 const TEST_FAILED_START_PORT = 38081
+let TEST_GATEWAY_PORT = 0
 const SESSION_HISTORY_PATH = '/api/session.history'
 const COMPRESSIBLE_SCRIPT = 'globalThis.__compressionProbe = true;\n'.repeat(256)
 const UPSTREAM_LAUNCH_TOKEN = 'test-launch-token'
@@ -51,6 +51,21 @@ async function listen(server: Server): Promise<number> {
     server.listen(0, '127.0.0.1', () => resolve())
   })
   return (server.address() as AddressInfo).port
+}
+
+/**
+ * Ask the host for a free port.
+ *
+ * The gateway binds a port the caller names, so it cannot bind 0. A fixed number
+ * collides with whatever the runner already has on it, so the file asks for one
+ * free port up front and reuses it across tests — which run one at a time here.
+ * @returns A port number that was free a moment ago.
+ */
+async function freePort(): Promise<number> {
+  const probe = createServer()
+  const port = await listen(probe)
+  await new Promise<void>(resolve => { probe.close(() => resolve()) })
+  return port
 }
 
 async function closeServer(server: Server, sockets: Set<Socket> = new Set()): Promise<void> {
@@ -401,6 +416,8 @@ async function openWebSocket(
     })
   })
 }
+
+beforeAll(async () => { TEST_GATEWAY_PORT = await freePort() })
 
 describe('HTTP gateway', () => {
   it('serves authenticated computer image browsing without proxying filesystem paths', async () => {

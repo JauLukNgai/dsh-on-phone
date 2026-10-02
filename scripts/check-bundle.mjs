@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
-const server = fileURLToPath(new URL('../lib/index.mjs', import.meta.url))
+const serverUrl = new URL('../lib/index.mjs', import.meta.url)
 const client = fileURLToPath(new URL('../lib/client.js', import.meta.url))
 
 const fail = (message) => {
@@ -22,14 +22,15 @@ const fail = (message) => {
   process.exit(1)
 }
 
-for (const path of [server, client]) {
-  if (!existsSync(path)) fail(`${path} is missing — run \`npm run build\` first`)
-}
+if (!existsSync(fileURLToPath(serverUrl))) fail(`${fileURLToPath(serverUrl)} is missing — run \`npm run build\` first`)
+if (!existsSync(client)) fail(`${client} is missing — run \`npm run build\` first`)
 
 const expected = ['apply', 'inject', 'name', 'MobileAccessGateway', 'rewriteRemoteMobileIndex']
 let loaded
 try {
-  loaded = await import(server)
+  // The URL, not a path: `import()` reads a bare Windows path as the URL scheme
+  // `d:` and refuses it, so `fileURLToPath` here would break the Windows run.
+  loaded = await import(serverUrl.href)
 } catch (error) {
   fail(`lib/index.mjs cannot be imported by Node: ${error instanceof Error ? error.message : String(error)}`)
 }

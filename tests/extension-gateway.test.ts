@@ -20,6 +20,23 @@ async function listen(server: Server): Promise<number> {
   return (server.address() as AddressInfo).port
 }
 
+/**
+ * Ask the host for a free port.
+ *
+ * The gateway under test binds a port the caller names, so it cannot bind 0 the
+ * way `listen` above does. A fixed number instead collides with whatever the
+ * runner already has on it (EADDRINUSE on 127.0.0.1:38082 took a CI run down),
+ * so the number is asked for and released immediately, and the caller binds it
+ * at once.
+ * @returns A port number that was free a moment ago.
+ */
+async function freePort(): Promise<number> {
+  const probe = createServer()
+  const port = await listen(probe)
+  await new Promise<void>(resolve => { probe.close(() => resolve()) })
+  return port
+}
+
 async function request(port: number, path: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
   return new Promise((resolve, reject) => {
     const body = options.body
@@ -52,7 +69,7 @@ describe('gateway extension namespace', () => {
       actions: { echo: { run: async (_context, input) => ({ input }) } },
       routes: [{ method: 'GET', path: 'status', handle: async () => ({ contentType: 'application/json', body: JSON.stringify({ ok: true }) }) }],
     })
-    const config = parseGatewayConfig({ listenHost: '127.0.0.1', listenPort: 38082, upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`, publicAuthorities: ['127.0.0.1'], allowedCidrs: ['127.0.0.0/8'], stateFile: join(directory, 'devices.json'), tls: { mode: 'disabled' } })
+    const config = parseGatewayConfig({ listenHost: '127.0.0.1', listenPort: await freePort(), upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`, publicAuthorities: ['127.0.0.1'], allowedCidrs: ['127.0.0.0/8'], stateFile: join(directory, 'devices.json'), tls: { mode: 'disabled' } })
     const gateway = new MobileAccessGateway(config, new MemoryDeviceStore(), service)
     await gateway.start(); cleanups.push(() => gateway.close())
     const opened = await gateway.access.openPairing()
@@ -76,7 +93,7 @@ describe('gateway extension namespace', () => {
     const context = new Context(); cleanups.push(() => context.fiber.dispose())
     const service = new MobileAccessService(context)
     service.registerExtension({ schemaVersion: 1, id: 'hello', name: 'Hello', version: '1.0.0' })
-    const config = parseGatewayConfig({ listenHost: '127.0.0.1', listenPort: 38084, upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`, publicAuthorities: ['127.0.0.1'], allowedCidrs: ['127.0.0.0/8'], stateFile: join(directory, 'devices.json'), tls: { mode: 'disabled' } })
+    const config = parseGatewayConfig({ listenHost: '127.0.0.1', listenPort: await freePort(), upstreamOrigin: `http://127.0.0.1:${String(upstreamPort)}`, publicAuthorities: ['127.0.0.1'], allowedCidrs: ['127.0.0.0/8'], stateFile: join(directory, 'devices.json'), tls: { mode: 'disabled' } })
     const gateway = new MobileAccessGateway(config, new MemoryDeviceStore(), service)
     await gateway.start(); cleanups.push(() => gateway.close())
     const opened = await gateway.access.openPairing()
