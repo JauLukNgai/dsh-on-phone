@@ -40,4 +40,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Probe how a .cmd fake spawns (TEMPORARY)
+        if: runner.os == 'Windows'
+        run: node scripts/probe-windows-fake.mjs
       - run: npm run verify
