@@ -7,6 +7,13 @@ import { installTerminalKeyRepair } from './terminal-keys.js'
 
 /** Mobile feature and compatibility rules applied to DSH React surfaces. */
 export const NATIVE_MOBILE_STYLES = `
+/* The mobile layer is installed for every page the mobile gateway serves, but
+   the backdrop it appends belongs to the phone-width drawer: every other rule
+   about it lives inside the max-width:720px query below. A desktop-width
+   window on the remote-channel URL therefore rendered the button as a default
+   in-flow <button> at the end of <body> — a stray element plus page scroll.
+   Keep it out of layout above the drawer breakpoint. */
+@media (min-width:721px) { .dsh-native-mobile-backdrop { display:none !important; } }
 /* iOS inflates text in wide (landscape) viewports unless text-size-adjust is
    pinned; this must apply outside the width media query so landscape phones
    (which exceed 720px wide) are covered too. */
