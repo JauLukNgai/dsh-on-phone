@@ -124,6 +124,16 @@ describe('native mobile presentation', () => {
     expect(NATIVE_MOBILE_STYLES).not.toContain('html.dsh-native-mobile-active :focus { outline:none')
   })
 
+  it('hides the backdrop above the phone breakpoint', () => {
+    // The mobile layer also runs at desktop widths (the remote-channel URL can
+    // be opened in a desktop browser), while the backdrop's fixed positioning
+    // and its [hidden] rule only exist inside the phone query. Without a base
+    // rule the button falls back to an in-flow default <button> at the end of
+    // <body>, adding a stray element and page scroll.
+    expect(NATIVE_MOBILE_STYLES).toContain('@media (min-width:721px) { .dsh-native-mobile-backdrop { display:none !important; } }')
+    expect(NATIVE_MOBILE_STYLES.indexOf('@media (min-width:721px)')).toBeLessThan(NATIVE_MOBILE_STYLES.indexOf('@media (max-width:720px)'))
+  })
+
   it('stacks narrow settings and conversation metadata instead of squeezing text', () => {
     expect(NATIVE_MOBILE_STYLES).toContain('data-slot="settings.general.item"')
     expect(NATIVE_MOBILE_STYLES).toContain('flex-direction:column !important')
