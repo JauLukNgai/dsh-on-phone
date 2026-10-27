@@ -1,6 +1,6 @@
 {
   "name": "dsh-on-phone",
-  "version": "0.8.13",
+  "version": "0.8.14",
   "private": false,
   "description": "让手机成为 DeepSeek Harness 的第二块屏：手机浏览器打开你自己 tailnet 里的地址，就能直接用电脑上的 DSH。默认走 Tailscale Serve，无需配对、不经第三方中继。",
   "type": "module",

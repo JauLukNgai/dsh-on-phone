@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.14
+
+- **The drawer backdrop no longer becomes a stray button on a desktop-width page** (from [#7](https://github.com/JauLukNgai/dsh-on-phone/pull/7), by @Bozhu12). The mobile layer is installed on every page the gateway serves, but only the rules inside `@media (max-width:720px)` style its backdrop. A desktop-width window on the remote-channel URL therefore rendered the element as a UA default in-flow `<button>` at the end of `<body>` — a 16×6 box just below the fold, ~18px of extra page scroll, and a tap target that collapsed the sidebar. A base rule now hides it above the drawer breakpoint, and a test pins both the rule and its placement before the phone query.
+
 ## 0.8.13
 
 - **DSH 0.2.1-rc.2 is now a declared peer, because the gate 0.2.0 added skips this plugin outright.** The gate compares each profile bundle's own DSH peers with the running Host and *skips* an incompatible bundle instead of loading it, so on 0.2.1-rc.2 the plugin stayed installed and simply never appeared — no error, no dialog, just a silent `skipping profile bundle "dsh-on-phone"` line on the Host's stdout. All five DSH peers now list `0.2.1-rc.2`, and `SUPPORTED_DSH_VERSIONS` carries it too, so the advisory `DSH_ON_PHONE_UNVERIFIED_DSH_VERSION` warning stops firing on the current runtime.
