@@ -138,7 +138,7 @@ The full handbook is [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The three most co
 
 ## Supported DSH versions
 
-Verified against the prerelease line from `0.1.0-rc.5` through `0.2.1-rc.2`; the full list is the peerDependencies in [package.json](package.json). Installing successfully but producing "no reaction at all" usually means the version gate — see [Troubleshooting](#troubleshooting).
+Verified against the prerelease line from `0.1.0-rc.5` through `0.2.1-rc.3`; the full list is the peerDependencies in [package.json](package.json). Installing successfully but producing "no reaction at all" usually means the version gate — see [Troubleshooting](#troubleshooting).
 
 ## Contributing
 

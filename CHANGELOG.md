@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.15
+
+- **DSH 0.2.1-rc.3 is a declared peer.** The bundle gate shipped in 0.2.0 compares each plugin's own DSH peers with the running Host and skips a bundle whose declared set does not contain it, so on 0.2.1-rc.3 the plugin would have stayed installed and never loaded — no error, no dialog, only a `skipping profile bundle "dsh-on-phone"` line on the Host's stdout. All five DSH peers and `SUPPORTED_DSH_VERSIONS` now list `0.2.1-rc.3`.
+- **Nothing else changed, because nothing else had to.** The client sources this plugin reaches into — `connection`, `ui-settings`, `ui-sidebar`, `ui-layout`, `ui-conversation`, `ui-renderer`, `ui-session`, `web` — are byte-identical between 0.2.1-rc.2 and 0.2.1-rc.3, and the contracts the checker asserts still hold: `tsc --noEmit` is clean, all tests pass, the bundle imports cleanly, and the checker reports `DSH frontend contract recognized: 0.2.1-rc.3 (renderer-v2)`. The development dependencies move to 0.2.1-rc.3 so the source is compiled against the release the peers now claim, and `tsdown` is pinned to 0.23.1: 0.23.2 resolves a beta `rolldown-plugin-dts` that no longer bundles the classic TypeScript API this build (TypeScript 7.0.2) needs, and the declaration emit fails on it.
+
 ## 0.8.14
 
 - **The drawer backdrop no longer becomes a stray button on a desktop-width page** (from [#7](https://github.com/JauLukNgai/dsh-on-phone/pull/7), by @Bozhu12). The mobile layer is installed on every page the gateway serves, but only the rules inside `@media (max-width:720px)` style its backdrop. A desktop-width window on the remote-channel URL therefore rendered the element as a UA default in-flow `<button>` at the end of `<body>` — a 16×6 box just below the fold, ~18px of extra page scroll, and a tap target that collapsed the sidebar. A base rule now hides it above the drawer breakpoint, and a test pins both the rule and its placement before the phone query.

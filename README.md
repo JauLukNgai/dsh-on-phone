@@ -138,7 +138,7 @@ dsh plugin --profile web add "$PWD/$(ls -1 dsh-on-phone-*.tgz | sort -V | tail -
 
 ## 支持哪些 DSH 版本
 
-已验证 `0.1.0-rc.5` 到 `0.2.1-rc.2` 这一段的预发布版本，完整清单见 [package.json](package.json) 的 peerDependencies。安装成功却「没有任何反应」，通常就是撞上了版本门禁，见[排障](#排障)。
+已验证 `0.1.0-rc.5` 到 `0.2.1-rc.3` 这一段的预发布版本，完整清单见 [package.json](package.json) 的 peerDependencies。安装成功却「没有任何反应」，通常就是撞上了版本门禁，见[排障](#排障)。
 
 ## 参与贡献
 
