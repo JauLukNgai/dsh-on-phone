@@ -133,7 +133,7 @@
     "@deepseek-ai/dsh-commands": "0.2.1-rc.5",
     "@deepseek-ai/dsh-host-webserver": "0.2.1-rc.5",
     "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
-    "@types/node": "^24.3.0",
+    "@types/node": "^26.6.6",
     "@types/qrcode": "^1.5.5",
     "@types/react": "~19.3.0",
     "js-yaml": "^5.4.2",
