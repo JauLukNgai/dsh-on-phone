@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.16
+
+- **DSH 0.2.1-rc.4 and 0.2.1-rc.5 are declared peers.** This is the same bundle gate as the two releases before it: a profile bundle whose own DSH peers do not contain the running Host is skipped outright, so a Host on either prerelease would have lost mobile access silently, with nothing in the UI to explain it. All five DSH peers and `SUPPORTED_DSH_VERSIONS` now list both.
+- **Nothing else had to change.** Between 0.2.1-rc.3 and 0.2.1-rc.5 the client sources this plugin reaches into — `connection`, `ui-settings`, `ui-sidebar`, `ui-layout`, `ui-conversation`, `ui-renderer`, `ui-session`, `web` — and `packages/host/webserver/src` are byte-identical, and the checker reports `DSH frontend contract recognized: 0.2.1-rc.4` and `0.2.1-rc.5`. The development dependencies move to 0.2.1-rc.5 so the source is compiled against the release the peers now claim.
+
 ## 0.8.15
 
 - **DSH 0.2.1-rc.3 is a declared peer.** The bundle gate shipped in 0.2.0 compares each plugin's own DSH peers with the running Host and skips a bundle whose declared set does not contain it, so on 0.2.1-rc.3 the plugin would have stayed installed and never loaded — no error, no dialog, only a `skipping profile bundle "dsh-on-phone"` line on the Host's stdout. All five DSH peers and `SUPPORTED_DSH_VERSIONS` now list `0.2.1-rc.3`.
