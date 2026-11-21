@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { BACKDROP_SETTLE_MS, HISTORY_FILL_INTERVAL_MS, HISTORY_FILL_MAX_PAGES, HISTORY_FILL_MAX_STALLS, HISTORY_TOP_RETRY_MS, NATIVE_MOBILE_STYLES, drawerBackgroundColor, findDetailsSheetHost, findRightPanelHost, isComposerEditorFocus, isMenuSearchFocus, nextSyncDelay, preservesMenuFocus, rightColumnOpen, rightPanelOpen, selectsSidebarRow, shouldAutoLoadEarlier, shouldFillEarlierHistory, shouldRetryEarlierHistory } from '../src/native-mobile.js'
+import { BACKDROP_SETTLE_MS, HISTORY_FILL_INTERVAL_MS, HISTORY_FILL_MAX_PAGES, HISTORY_FILL_MAX_STALLS, HISTORY_TOP_RETRY_MS, NATIVE_MOBILE_STYLES, drawerBackgroundColor, findDetailsSheetHost, findRightPanelHost, isComposerEditorFocus, isMenuSearchFocus, nextSyncDelay, preservesMenuFocus, rightColumnOpen, rightPanelOpen, selectsSidebarRow, shouldAutoLoadEarlier, shouldFillEarlierHistory, shouldRetryEarlierHistory, sidebarShellState } from '../src/native-mobile.js'
 
 /** Minimal stand-in for an element whose `closest` resolves to a fixed match. */
 function fakeElement(closest: Element | null): Element {
@@ -481,4 +481,27 @@ describe('native mobile presentation', () => {
     expect(drawerBackgroundColor(surface, read('rgba(21, 21, 23, 0.4)'))).toBeUndefined()
     expect(drawerBackgroundColor(surface, read(''))).toBeUndefined()
   })
+
+  it('reads the drawer state from the shell when it publishes one', () => {
+    // Real class tokens are hashed module names that end with the local one,
+    // e.g. `kB3qhq_root` / `kB3qhq_collapsed`.
+    const root = (collapsedClass: boolean): Element =>
+      ({ classList: collapsedClass ? ['kB3qhq_root', 'kB3qhq_collapsed'] : ['kB3qhq_root'] }) as unknown as Element
+    const frame = (attributes: readonly string[]): Element =>
+      ({ hasAttribute: (name: string) => attributes.includes(name) }) as unknown as Element
+
+    // 0.2.2: the layout frame carries the state and owns the dim in drawer mode.
+    // The sidebar root stops carrying `_collapsed` there at all, which is what
+    // left this layer's backdrop covering the composer.
+    expect(sidebarShellState(frame(['data-sidebar-drawer', 'data-sidebar-collapsed']), root(false))).toEqual({ collapsed: true, shellOwnsMask: true })
+    expect(sidebarShellState(frame(['data-sidebar-drawer']), root(false))).toEqual({ collapsed: false, shellOwnsMask: true })
+    expect(sidebarShellState(frame(['data-sidebar-collapsed']), root(false))).toEqual({ collapsed: true, shellOwnsMask: false })
+    expect(sidebarShellState(frame([]), root(true))).toEqual({ collapsed: false, shellOwnsMask: false })
+
+    // Up to 0.2.1 there is no frame attribute set to read; the hashed class on
+    // the root remains the only signal, and this layer keeps painting the dim.
+    expect(sidebarShellState(undefined, root(true))).toEqual({ collapsed: true, shellOwnsMask: false })
+    expect(sidebarShellState(undefined, root(false))).toEqual({ collapsed: false, shellOwnsMask: false })
+  })
+
 })

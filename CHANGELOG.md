@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.17
+
+- **The drawer backdrop follows the shell's drawer state again on DSH 0.2.2.** 0.2.2 moved that state from a hashed `_collapsed` class on the sidebar root onto the layout frame (`data-sidebar-collapsed`, with `data-sidebar-drawer` marking the phone-width drawer mode), and in drawer mode the root no longer carries `_collapsed` at all: the sidebar stays wide while it animates. The old probe therefore read "expanded" forever, kept this layer's full-viewport backdrop live, and left it covering the composer in portrait — a tap landed on the dim instead of the input. The layer now reads the frame attribute when the shell publishes one and falls back to the class for older hosts.
+- **The shell's own drawer mask wins where it exists.** 0.2.2 renders `[data-sidebar-mask]` in drawer mode, closes the drawer when it is tapped and marks the other columns inert; this layer's backdrop now steps aside there instead of dimming twice on top of it. The frame is also watched for attribute changes, so opening and closing the drawer republishes immediately instead of waiting for an unrelated mutation.
+- **DSH 0.2.2-rc.5 is a declared peer**, so the bundle gate loads the plugin on it without an exemption. The development dependencies move to 0.2.2-rc.5, and the compatibility checker now asserts that either the frame attributes or the `css.collapsed` class still exists — the drawer state must stay readable one way or the other.
+
 ## 0.8.16
 
 - **DSH 0.2.1-rc.4 and 0.2.1-rc.5 are declared peers.** This is the same bundle gate as the two releases before it: a profile bundle whose own DSH peers do not contain the running Host is skipped outright, so a Host on either prerelease would have lost mobile access silently, with nothing in the UI to explain it. All five DSH peers and `SUPPORTED_DSH_VERSIONS` now list both.

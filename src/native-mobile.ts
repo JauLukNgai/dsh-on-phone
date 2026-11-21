@@ -384,6 +384,33 @@ function firstByClassSuffix(root: ParentNode, suffix: string): HTMLElement | und
   return Array.from(root.querySelectorAll<HTMLElement>('[class]')).find(element => classToken(element, suffix))
 }
 
+/**
+ * Whether the app shell reports its left drawer as collapsed, and whether the
+ * shell paints the dim itself.
+ *
+ * Up to 0.2.1 the only signal was a hashed `_collapsed` class on the sidebar
+ * root, and this layer dimmed the drawer with its own full-viewport backdrop.
+ * 0.2.2 moved the state onto the layout frame as `data-sidebar-collapsed` (the
+ * attribute is absent while the drawer is open) and, at phone widths, renders a
+ * `[data-sidebar-mask]` of its own that closes the drawer on tap and marks the
+ * other columns inert. In that drawer mode the root never carries `_collapsed`
+ * at all — the sidebar stays `wide` while it animates — so the old check read
+ * "expanded" forever and kept this layer's backdrop live over the composer.
+ * @param frame - The stock layout frame, when this document has one.
+ * @param root - The sidebar root this layer marks.
+ * @returns The collapse state, and whether the shell already owns the dim.
+ */
+export function sidebarShellState(
+  frame: Element | undefined,
+  root: Element,
+): { collapsed: boolean; shellOwnsMask: boolean } {
+  if (frame === undefined) return { collapsed: classToken(root, '_collapsed'), shellOwnsMask: false }
+  return {
+    collapsed: frame.hasAttribute('data-sidebar-collapsed'),
+    shellOwnsMask: frame.hasAttribute('data-sidebar-drawer'),
+  }
+}
+
 const AUTO_HISTORY_THRESHOLD_PX = 64
 
 /**
@@ -1215,9 +1242,13 @@ export function installNativeMobileSurface(): () => void {
       if (brand.textContent?.trim() === 'DSH Local Build') brand.textContent = 'DeepSeek Harness'
     }
     if (toggle !== undefined) toggle.dataset.dshOnPhoneToggle = 'true'
-    const collapsed = classToken(sidebarRoot, '_collapsed')
-    sidebar.dataset.open = String(!collapsed)
-    setBackdropOpen(!collapsed)
+    const shell = sidebarShellState(frame, sidebarRoot)
+    sidebar.dataset.open = String(!shell.collapsed)
+    // The shell's own drawer mask already dims the page, closes the drawer on
+    // tap and makes the other columns inert; painting this layer's backdrop on
+    // top of it would dim twice and, while the mask is up, sit over the
+    // composer. Hand the dim over wherever the shell reports drawer mode.
+    setBackdropOpen(!shell.shellOwnsMask && !shell.collapsed)
   }
   // A pass walks the whole document, so mutations are coalesced: the app
   // rewrites class/style continuously while a turn streams, and running the pass
@@ -1228,6 +1259,7 @@ export function installNativeMobileSurface(): () => void {
   const isStateRecord = (record: MutationRecord): boolean =>
     record.attributeName !== null
     && (record.target === workbenchPanel
+      || record.target === frame
       || record.target === sidebar
       || record.target === sidebarRoot
       || record.target === backdrop)
@@ -1257,6 +1289,8 @@ export function installNativeMobileSurface(): () => void {
       'disabled',
       'hidden',
       'data-rightbar-collapsed',
+      'data-sidebar-collapsed',
+      'data-sidebar-drawer',
       'data-sidebar-right-open',
       'data-sidebar-right-unavailable',
       'aria-hidden',

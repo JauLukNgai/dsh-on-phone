@@ -217,6 +217,21 @@ const localeEnglish = await optionalText('packages/client/locale/src/locales/en.
 if (!sidebarSource.includes('DSH Local Build') && !localeEnglish?.includes("'brand.localBuild': 'DSH Local Build'")) {
   throw new Error('DSH sidebar fallback brand changed: missing DSH Local Build')
 }
+// The drawer state this layer mirrors moved in 0.2.2 from a hashed `_collapsed`
+// class on the sidebar root onto the layout frame (`data-sidebar-collapsed`,
+// with `data-sidebar-drawer` marking the phone-width drawer mode), where the
+// shell also renders its own `[data-sidebar-mask]` and marks the other columns
+// inert. This layer reads the frame attribute when it exists and otherwise falls
+// back to the class, so one of the two shapes has to survive; if both are gone
+// the drawer state is unknowable and the backdrop would stick over the composer.
+const layoutFrameSource = await optionalText('packages/client/ui-layout/src/client/AppFrame.tsx')
+const shellDrawer = layoutFrameSource !== undefined
+  && ['data-sidebar-collapsed', 'data-sidebar-drawer', 'data-sidebar-mask'].every(marker => layoutFrameSource.includes(marker))
+if (!shellDrawer && !sidebarSource.includes('css.collapsed')) {
+  throw new Error(
+    `DSH sidebar drawer state is unreadable: ${root.version} publishes neither the frame's data-sidebar-collapsed/data-sidebar-drawer nor a css.collapsed class on the sidebar root`
+  )
+}
 
 const questions = await text('packages/client/ui-user-questions/src/client/QuestionComposer.tsx')
 const planReview = await text('packages/client/ui-user-questions/src/client/PlanReviewPanel.tsx')
